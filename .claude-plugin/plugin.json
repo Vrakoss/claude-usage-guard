@@ -1,0 +1,13 @@
+{
+  "name": "usage-guard",
+  "displayName": "Usage Guard",
+  "version": "0.1.0",
+  "description": "Deterministic hook-enforced subscription-quota guard for Claude Code. Warns as you approach your usage limits and blocks prompts/tools when a window is exhausted, steering the model to self-schedule a wakeup past the reset.",
+  "author": {
+    "name": "Vrakoss",
+    "url": "https://github.com/Vrakoss"
+  },
+  "repository": "https://github.com/Vrakoss/claude-usage-guard",
+  "license": "MIT",
+  "keywords": ["quota", "rate-limit", "hooks", "usage"]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "claude-usage-guard",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.mjs\""
+  },
+  "license": "MIT"
+}

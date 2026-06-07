@@ -1,0 +1,14 @@
+{
+  "name": "claude-usage-guard",
+  "owner": { "name": "Vrakoss" },
+  "metadata": {
+    "description": "Subscription-quota guard for Claude Code — warns near your usage limits and blocks new work when a window is exhausted."
+  },
+  "plugins": [
+    {
+      "name": "usage-guard",
+      "source": "./",
+      "description": "Deterministic hook-enforced subscription-quota guard for Claude Code. Warns as you approach your usage limits and blocks prompts/tools when a window is exhausted, steering the model to self-schedule a wakeup past the reset."
+    }
+  ]
+}
