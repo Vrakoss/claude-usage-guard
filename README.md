@@ -9,6 +9,21 @@ through retries.
 > **Heads up:** this reads an **undocumented** endpoint and **fails open**. Read the
 > [Disclaimer](#disclaimer) before relying on it.
 
+## Why
+
+There are two ways to run into a usage window in Claude Code, and both hurt when they
+happen *unintentionally*:
+
+- **With "extra usage" enabled** on your plan, work silently continues past your included
+  limits and is **billed at API-token rates** — an unattended loop, agent fan-out, or
+  long autonomous session can keep spending real money without you noticing.
+- **Without it**, the session just hits the wall mid-task.
+
+The guard is a deterministic backstop for both: it warns you while there is still time to
+wind down, and hard-blocks new work *before* a window is exhausted — so you stay within
+your plan's included usage instead of rolling into billed extra usage, and an autonomous
+session pauses itself until the reset instead of burning retries (or your wallet).
+
 ## What it does
 
 The guard runs on two hook events and reads your usage from Anthropic's OAuth usage
