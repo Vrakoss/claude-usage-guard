@@ -211,16 +211,24 @@ export function validateCache(raw) {
  * From validated cache data, produce a list of window descriptors:
  *   [{ label, util (rounded int), reset (Date) }]
  * Skips null/missing windows.
+ *
+ * When `now` (a Date) is provided, windows whose reset time has already
+ * passed are dropped: their utilization is stale by definition (the window
+ * has reset server-side), so they must never drive a warn/block. Without
+ * this, a stale cache plus unreachable credentials could block prompts
+ * indefinitely past the actual reset.
  */
-export function parseWindows(data) {
+export function parseWindows(data, now) {
   const out = [];
   if (!data || !isPlainObject(data.windows)) return out;
+  const nowMs = now instanceof Date ? now.getTime() : null;
   for (const [key, label] of Object.entries(WINDOW_LABELS)) {
     const w = data.windows[key];
     if (!w) continue;
     const util = Math.round(w.utilization);
     const reset = new Date(w.resets_at);
     if (Number.isNaN(reset.getTime())) continue;
+    if (nowMs !== null && reset.getTime() <= nowMs) continue;
     out.push({ label, util, reset });
   }
   return out;
@@ -253,7 +261,10 @@ export function evaluateThresholds(windows, cfg) {
 // Date / summary formatting
 // ---------------------------------------------------------------------------
 
-const WEEKDAYS_SHORT = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+// Fixed English labels, local timezone. Deterministic across ICU versions
+// (no Intl), unambiguous internationally (no DD/MM vs MM/DD).
+const WEEKDAYS_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -268,7 +279,7 @@ function fmtWeekdayTime(d) {
 }
 
 function fmtWeekdayDateTime(d) {
-  return `${WEEKDAYS_SHORT[d.getDay()]} ${pad2(d.getDate())}.${pad2(d.getMonth() + 1)}. ${fmtTime(d)}`;
+  return `${WEEKDAYS_SHORT[d.getDay()]} ${d.getDate()} ${MONTHS_SHORT[d.getMonth()]} ${fmtTime(d)}`;
 }
 
 // 7d windows show date; 5h shows weekday+time only.
@@ -282,7 +293,7 @@ function fmtReset(w) {
 
 /**
  * One-line human summary across all available windows.
- *   [usage] 5h: 32% (reset So 15:50) | 7d: 5% (reset Mi 19.06. 19:00) | ...
+ *   [usage] 5h: 32% (reset Sun 15:50) | 7d: 5% (reset Wed 19 Jun 19:00) | ...
  */
 export function formatSummary(windows) {
   const parts = windows.map(
@@ -503,7 +514,10 @@ async function writeCache(deps, clean, log) {
   try {
     const dir = claudeDir(deps.homedir);
     const cachePath = joinPath(dir, CACHE_BASENAME);
-    const tmpPath = joinPath(dir, `${CACHE_BASENAME}.${deps.now().getTime()}.tmp`);
+    // pid in the tmp name: UserPromptSubmit and PreToolUse hooks can run
+    // concurrently in separate processes within the same millisecond.
+    const pid = typeof deps.pid === 'number' ? deps.pid : 0;
+    const tmpPath = joinPath(dir, `${CACHE_BASENAME}.${pid}.${deps.now().getTime()}.tmp`);
     const payload = JSON.stringify(clean);
     await deps.fs.writeFile(tmpPath, payload, { mode: 0o600 });
     await deps.fs.rename(tmpPath, cachePath);
@@ -564,17 +578,10 @@ async function fetchUsage(deps, tokenHolder, log) {
  */
 function serializeUsageResponse(body, now) {
   if (!isPlainObject(body)) return null;
-  const rawWindows = isPlainObject(body) ? body : {};
-  const candidate = { fetchedAt: now.getTime(), failedAt: null, windows: {} };
-  for (const key of Object.keys(WINDOW_LABELS)) {
-    const w = rawWindows[key];
-    if (w === undefined || w === null) continue;
-    const cleaned = validateWindowEntry(w);
-    if (cleaned === null) return null; // malformed present window => reject
-    candidate.windows[key] = cleaned;
-  }
-  // Re-run through validateCache for a single source of truth.
-  return validateCache(candidate);
+  // validateCache is the single source of truth: it allowlists known window
+  // keys, validates each present entry (rejecting the whole response on any
+  // malformed present window), and ignores unknown keys.
+  return validateCache({ fetchedAt: now.getTime(), failedAt: null, windows: body });
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +688,7 @@ export function parseHookInput(text) {
  *       appendFileSync [sync, optional — used for debug log so it survives exit]),
  *   execFileImpl, platform, env, stdin (async () => text),
  *   stdout (fn), stderr (fn), now (() => Date), homedir (() => string),
- *   exit (code => void)
+ *   pid (number, for unique tmp-file names), exit (code => void)
  * }
  */
 export async function main(deps) {
@@ -723,7 +730,9 @@ export async function main(deps) {
       liveTokenProbe = raw;
     });
 
-    const windows = parseWindows(data);
+    // Pass `now` so windows whose reset already passed are dropped — stale
+    // data must never block past the actual reset.
+    const windows = parseWindows(data, deps.now());
     const { worst, level } = evaluateThresholds(windows, cfg);
 
     if (eventName === 'PreToolUse') {
@@ -846,6 +855,7 @@ async function buildRealDeps() {
     stderr: (s) => process.stderr.write(s),
     now: () => new Date(),
     homedir: () => os.homedir(),
+    pid: process.pid,
     exit: (code) => process.exit(code),
   };
 }

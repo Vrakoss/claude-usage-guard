@@ -14,7 +14,12 @@ through retries.
 The guard runs on two hook events and reads your usage from Anthropic's OAuth usage
 endpoint (cached locally). It compares the worst utilization across your rolling windows
 (`5h`, `7d`, and the per-model `7d-opus` / `7d-sonnet` windows when present) against two
-thresholds — **WARN** (default 80%) and **HARD** (default 95%).
+thresholds — **WARN** (default 80%) and **HARD** (default 95%). Windows whose reset time
+has already passed are ignored entirely — stale data can never block you past the actual
+reset.
+
+Reset times are shown in your **local timezone** with fixed English labels, e.g.
+`[usage] 5h: 32% (reset Sun 15:50) | 7d: 5% (reset Wed 19 Jun 19:00)`.
 
 | Event | Condition | Behavior | Exit |
 |-------|-----------|----------|------|

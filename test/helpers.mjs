@@ -133,6 +133,7 @@ export function makeDeps(overrides = {}) {
     stderr: (s) => stderrLines.push(s),
     now: fixedNow(),
     homedir: () => '/home/testuser',
+    pid: 4242,
     exit: (code) => exits.push(code),
   };
 
@@ -227,8 +228,10 @@ export const CREDS_PATH = `${CLAUDE_DIR}/.credentials.json`;
 export const RESET_IN_3H = new Date(FIXED_NOW_MS + 3 * 60 * 60 * 1000).toISOString();
 // A reset time in the future but > 6 hours (8 hours from FIXED_NOW_MS).
 export const RESET_IN_8H = new Date(FIXED_NOW_MS + 8 * 60 * 60 * 1000).toISOString();
-// A past reset time (window already reset).
+// A reset time just barely in the future (1 minute from FIXED_NOW_MS).
 export const RESET_IN_1MIN = new Date(FIXED_NOW_MS + 60_000).toISOString();
+// A reset time already in the past (window has reset; data is stale).
+export const RESET_PAST = new Date(FIXED_NOW_MS - 60_000).toISOString();
 
 // Sentinel token used for leak-detection tests.
 export const SENTINEL_TOKEN = 'SENTINEL-TOKEN-abc123XYZ';

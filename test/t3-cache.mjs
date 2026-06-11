@@ -283,4 +283,38 @@ describe('T3 — Cache', () => {
     assert.ok(fetchCalls.length >= 1, 'missing cache → fetch');
     assert.equal(exits[0], 0);
   });
+
+  // -------------------------------------------------------------------------
+  // T3.9 Temp filename contains the pid (concurrent-hook collision guard)
+  // -------------------------------------------------------------------------
+  it('T3.9 tmp filename includes pid so concurrent hook processes cannot collide', async () => {
+    const staleAt = FIXED_NOW_MS - 2 * TTL_MS;
+    const cache = makeCacheJson(staleAt, {});
+
+    const { deps, fakeFs, exits } = makeDeps({
+      env: makeEnv(),
+      stdin: async () => UPS,
+      initialFs: {
+        [CACHE_PATH]: cache,
+        [CREDS_PATH]: makeCredsJson('test-token'),
+      },
+      now: () => new Date(FIXED_NOW_MS),
+      fetchImpl: async () => ({
+        status: 200,
+        async json() {
+          return {
+            five_hour: { utilization: 30, resets_at: RESET_IN_3H },
+          };
+        },
+      }),
+    });
+
+    await main(deps);
+
+    const tmpWrite = fakeFs.writes.find((w) => w.path.includes('.tmp'));
+    assert.ok(tmpWrite, 'should write a .tmp file');
+    // helpers.mjs makeDeps uses pid 4242.
+    assert.ok(tmpWrite.path.includes('.4242.'), 'tmp filename must embed the pid');
+    assert.equal(exits[0], 0);
+  });
 });
