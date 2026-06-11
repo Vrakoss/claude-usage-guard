@@ -53,6 +53,10 @@ The first command registers this repo as a plugin marketplace; the second instal
 `usage-guard` plugin from it. Requires Node.js **≥ 18** on your PATH (Claude Code already
 needs Node, so this is normally satisfied).
 
+**Verify:** start a new session and submit any prompt. A `[usage] 5h: N% …` line
+should appear in context. No line = guard failed open (missing creds / network /
+Node) — set `CLAUDE_USAGE_GUARD_DEBUG=1` and check the debug log.
+
 ## Configuration
 
 All configuration is via environment variables. Invalid / non-numeric values fall back to
@@ -65,6 +69,28 @@ the default; percentages are clamped to `1..100`; if `WARN ≥ HARD` both reset 
 | `CLAUDE_USAGE_GUARD_HARD` | `95` | Utilization % at which prompts/tools are blocked. |
 | `CLAUDE_USAGE_GUARD_TTL` | `60` | Seconds to trust the cached usage snapshot before re-fetching. |
 | `CLAUDE_USAGE_GUARD_DEBUG` | *(unset)* | Set to `1` to append allowlisted JSON-lines diagnostics to `~/.claude/usage-guard-debug.log`. |
+
+### Where to set these
+
+These are read from your **process environment**, so any mechanism that exports
+them to the Claude Code process works. The simplest is the `env` block in your
+Claude Code `settings.json`:
+
+```jsonc
+// ~/.claude/settings.json  (user-scope — all projects)
+// or  <project>/.claude/settings.json  (one project)
+{
+  "env": {
+    "CLAUDE_USAGE_GUARD_WARN": "80",
+    "CLAUDE_USAGE_GUARD_HARD": "95"
+  }
+}
+```
+
+Use **user-scope** to match the user-scope plugin install; use project-scope to
+tune one repo. Values reload on the **next session start** (env is read at launch).
+A shell `export CLAUDE_USAGE_GUARD=off` also works for sessions started from that
+shell.
 
 There is **no** environment variable to override the usage endpoint URL — this is a
 deliberate security decision (see below).
@@ -89,7 +115,8 @@ cannot leak through the usual exfiltration channels:
   override**, so a poisoned environment cannot redirect your bearer token to an
   attacker-controlled host.
 - **Allowlist cache validate-on-read.** The local cache
-  (`~/.claude/usage-guard-cache.json`, mode `0600`, atomic temp-file + rename writes) is
+  (`~/.claude/usage-guard-cache.json`, written `0600` on POSIX — Windows ACLs
+  inherit the user profile dir — atomic temp-file + rename writes) is
   run through a strict allowlist validator on every read: utilizations must be finite
   numbers (clamped `0..100`), reset timestamps must parse to a valid date. Any deviation
   discards the whole cache. **Nothing from the cache is ever echoed verbatim** — all output
@@ -125,8 +152,8 @@ cannot leak through the usual exfiltration channels:
   the Claude credentials. Allow it (or "Always Allow") so the guard can read your token. If
   you deny it, the guard falls back to the credentials file and, failing that, simply does
   nothing (fail-open).
-- **Disable temporarily.** Set `CLAUDE_USAGE_GUARD=off` in your environment to bypass the
-  guard entirely.
+- **Disable temporarily.** Set `CLAUDE_USAGE_GUARD=off` in your `settings.json` `env`
+  block (see [Where to set these](#where-to-set-these)) to bypass the guard entirely.
 - **Diagnose behavior.** Set `CLAUDE_USAGE_GUARD_DEBUG=1` and inspect
   `~/.claude/usage-guard-debug.log` (allowlisted, token-safe diagnostics).
 

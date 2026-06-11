@@ -26,6 +26,10 @@ be released as soon as practical and credited to you (unless you prefer otherwis
 - The guard **fails open** by design. "The guard did not block me" is expected behavior
   under any error condition and is not a vulnerability.
 - The usage endpoint is undocumented and may change; breakage is not a vulnerability.
+- The local cache lives in `~/.claude/`, the same directory as the credentials file.
+  Its integrity is therefore bounded by filesystem trust in that directory: a local
+  process that can tamper with the cache could already read the credentials, which is
+  strictly worse. Cache-tampering reports without a stronger primitive are out of scope.
 - Reports about the token leaking into output, cache, logs, error messages, or being sent
   to any host other than the hardcoded `api.anthropic.com` endpoint are **always** in
   scope and taken seriously.
