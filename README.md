@@ -1,5 +1,7 @@
 # claude-usage-guard
 
+![claude-usage-guard — deterministic quota guard for Claude Code](.github/social-preview.png)
+
 A zero-dependency [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin that
 **warns you as you approach your subscription usage limits and blocks new work when a
 window is exhausted** — deterministically, via hooks. When a limit is hit during a tool
