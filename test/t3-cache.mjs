@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { main, validateCache } from '../scripts/usage-guard.mjs';
 import {
   makeDeps,
+  makeFakeFs,
   makeCacheJson,
   makeNegativeCacheJson,
   makeCredsJson,
@@ -93,7 +94,7 @@ describe('T3 — Cache', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'stale cache should trigger a fetch');
+    assert.equal(fetchCalls.length, 1, 'stale cache should trigger exactly one fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -119,7 +120,7 @@ describe('T3 — Cache', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'corrupt cache should trigger a fetch (treated as miss)');
+    assert.equal(fetchCalls.length, 1, 'corrupt cache should trigger a fetch (treated as miss)');
     assert.equal(exits[0], 0, 'corrupt cache must not crash — fail-soft exit 0');
   });
 
@@ -170,7 +171,7 @@ describe('T3 — Cache', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'expired negative cache should trigger fetch');
+    assert.equal(fetchCalls.length, 1, 'expired negative cache should trigger fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -280,7 +281,7 @@ describe('T3 — Cache', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'missing cache → fetch');
+    assert.equal(fetchCalls.length, 1, 'missing cache → fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -316,5 +317,47 @@ describe('T3 — Cache', () => {
     // helpers.mjs makeDeps uses pid 4242.
     assert.ok(tmpWrite.path.includes('.4242.'), 'tmp filename must embed the pid');
     assert.equal(exits[0], 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T3.10 Failed rename → tmp file is unlinked (regression: audit #4 — EPERM
+  // on Windows while the target is held open used to orphan .tmp files)
+  // -------------------------------------------------------------------------
+  it('T3.10 rename failure → tmp file unlinked, fail-soft, summary still printed', async () => {
+    const staleAt = FIXED_NOW_MS - 2 * TTL_MS;
+    const fakeFs = makeFakeFs({
+      [CACHE_PATH]: makeCacheJson(staleAt, {}),
+      [CREDS_PATH]: makeCredsJson('test-token'),
+    });
+    const failingFs = {
+      ...fakeFs.fs,
+      async rename() {
+        throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      },
+    };
+
+    const { deps, stdout, exits } = makeDeps({
+      env: makeEnv(),
+      stdin: async () => UPS,
+      fs: failingFs,
+      now: () => new Date(FIXED_NOW_MS),
+      fetchImpl: async () => ({
+        status: 200,
+        async json() {
+          return { five_hour: { utilization: 30, resets_at: RESET_IN_3H } };
+        },
+      }),
+    });
+
+    await main(deps);
+
+    const tmpWrite = fakeFs.writes.find((w) => w.path.includes('.tmp'));
+    assert.ok(tmpWrite, 'tmp file was written before the failed rename');
+    assert.equal(fakeFs.unlinks.length, 1, 'tmp file must be unlinked after rename failure');
+    assert.equal(fakeFs.unlinks[0].path, tmpWrite.path, 'unlink target must be the tmp file');
+    // Cache write failure is fail-soft: fetched data still drives output.
+    assert.equal(exits[0], 0);
+    assert.equal(stdout.length, 1);
+    assert.ok(stdout[0].includes('[usage]'));
   });
 });

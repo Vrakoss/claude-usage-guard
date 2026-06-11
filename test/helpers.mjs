@@ -29,7 +29,7 @@ export function fixedNow(offsetMs = 0) {
  * Create a fake fs with a simple in-memory store.
  *
  * @param {Record<string,string>} initial  - pre-populated file paths → content
- * @returns {{ fs, writes, reads, renames, appends, appendSyncs }}
+ * @returns {{ fs, writes, reads, renames, appends, unlinks, store }}
  */
 export function makeFakeFs(initial = {}) {
   const store = { ...initial };
@@ -37,6 +37,7 @@ export function makeFakeFs(initial = {}) {
   const reads = []; // { path }
   const renames = []; // { from, to }
   const appends = []; // { path, content, options, sync: bool }
+  const unlinks = []; // { path }
 
   const fs = {
     async readFile(path, _enc) {
@@ -62,6 +63,11 @@ export function makeFakeFs(initial = {}) {
         delete store[fp];
       }
     },
+    async unlink(path) {
+      const p = normPath(path);
+      unlinks.push({ path: p });
+      delete store[p];
+    },
     async appendFile(path, content, options) {
       const p = normPath(path);
       appends.push({ path: p, content, options, sync: false });
@@ -78,7 +84,7 @@ export function makeFakeFs(initial = {}) {
     },
   };
 
-  return { fs, writes, reads, renames, appends, store };
+  return { fs, writes, reads, renames, appends, unlinks, store };
 }
 
 function normPath(p) {
@@ -101,31 +107,30 @@ export function makeDeps(overrides = {}) {
   const stderrLines = [];
   const exits = [];
   const fetchCalls = []; // { url, options }
+  const execCalls = []; // { cmd, args, opts }
 
   const fakeFs = makeFakeFs(overrides.initialFs ?? {});
 
   // Default happy-path creds file: no real token by default.
   // Callers set a sentinel token by supplying initialFs.
 
+  // Default impls do NOT record — the wrappers below are the single recording
+  // point, so each call lands in fetchCalls/execCalls exactly once and tests
+  // can assert exact call counts.
+  const defaultFetchImpl = async () => ({
+    status: 200,
+    async json() {
+      return {};
+    },
+  });
+  const defaultExecFileImpl = (_cmd, _args, _opts, cb) => {
+    // Default: keychain error (non-darwin tests don't invoke this).
+    cb(new Error('no keychain'), '');
+    return { on() {} };
+  };
+
   const defaultDeps = {
-    fetchImpl: async (_url, _opts) => {
-      fetchCalls.push({ url: _url, options: _opts });
-      // Default: return empty-window 200 response.
-      return {
-        status: 200,
-        async json() {
-          return {};
-        },
-      };
-    },
     fs: fakeFs.fs,
-    execFileImpl: (_cmd, _args, _opts, cb) => {
-      const call = { cmd: _cmd, args: _args, opts: _opts };
-      execCalls.push(call);
-      // Default: keychain error (non-darwin tests don't invoke this).
-      cb(new Error('no keychain'), '');
-      return { on() {} };
-    },
     platform: 'linux',
     env: {},
     stdin: async () => '',
@@ -137,8 +142,6 @@ export function makeDeps(overrides = {}) {
     exit: (code) => exits.push(code),
   };
 
-  const execCalls = [];
-
   // Merge: allow per-test overrides of top-level keys.
   const deps = {
     ...defaultDeps,
@@ -148,34 +151,17 @@ export function makeDeps(overrides = {}) {
     env: { ...(overrides.env ?? {}) },
   };
 
-  // Re-wire fetchImpl so we always record calls even if the caller supplies
-  // a custom fetchImpl.
-  if (overrides.fetchImpl) {
-    const inner = overrides.fetchImpl;
-    deps.fetchImpl = (url, opts) => {
-      fetchCalls.push({ url, options: opts });
-      return inner(url, opts);
-    };
-  } else {
-    deps.fetchImpl = (url, opts) => {
-      fetchCalls.push({ url, options: opts });
-      return defaultDeps.fetchImpl(url, opts);
-    };
-  }
+  const innerFetch = overrides.fetchImpl ?? defaultFetchImpl;
+  deps.fetchImpl = (url, opts) => {
+    fetchCalls.push({ url, options: opts });
+    return innerFetch(url, opts);
+  };
 
-  // Re-wire execFileImpl similarly.
-  if (overrides.execFileImpl) {
-    const inner = overrides.execFileImpl;
-    deps.execFileImpl = (cmd, args, opts, cb) => {
-      execCalls.push({ cmd, args, opts });
-      return inner(cmd, args, opts, cb);
-    };
-  } else {
-    deps.execFileImpl = (cmd, args, opts, cb) => {
-      execCalls.push({ cmd, args, opts });
-      return defaultDeps.execFileImpl(cmd, args, opts, cb);
-    };
-  }
+  const innerExec = overrides.execFileImpl ?? defaultExecFileImpl;
+  deps.execFileImpl = (cmd, args, opts, cb) => {
+    execCalls.push({ cmd, args, opts });
+    return innerExec(cmd, args, opts, cb);
+  };
 
   // Expose _peek at the top level of the returned fakeFs recorder,
   // so tests can do `fakeFs._peek(path)` directly.

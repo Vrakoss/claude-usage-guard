@@ -20,6 +20,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -171,20 +172,30 @@ function validateWindowEntry(entry) {
  * non-finite numbers, unparseable dates, unknown windows are simply dropped)
  * that leaves us without a usable structure => return null (treat as miss).
  *
+ * When `nowMs` is provided, timestamps from the future are distrusted and
+ * treated as absent: a poisoned `fetchedAt` could otherwise pin the cache
+ * permanently "fresh" (never refetched), and a future `failedAt` could pin
+ * the negative-cache backoff indefinitely.
+ *
  * Returns a freshly-built clean object: { fetchedAt, failedAt, windows }.
  * `raw` is never trusted for output.
  */
-export function validateCache(raw) {
+export function validateCache(raw, nowMs) {
   if (!isPlainObject(raw)) return null;
 
-  const fetchedAt =
+  let fetchedAt =
     typeof raw.fetchedAt === 'number' && Number.isFinite(raw.fetchedAt)
       ? raw.fetchedAt
       : null;
-  const failedAt =
+  let failedAt =
     typeof raw.failedAt === 'number' && Number.isFinite(raw.failedAt)
       ? raw.failedAt
       : null;
+
+  if (typeof nowMs === 'number' && Number.isFinite(nowMs)) {
+    if (fetchedAt !== null && fetchedAt > nowMs) fetchedAt = null;
+    if (failedAt !== null && failedAt > nowMs) failedAt = null;
+  }
 
   if (fetchedAt === null && failedAt === null) return null;
 
@@ -317,10 +328,13 @@ export function buildPromptBlockMessage(worst, cfg) {
 
 /** UserPromptSubmit WARN suffix appended to the summary line (stdout). */
 export function buildWarnSuffix(worst) {
+  // fmtReset, not fmtTime: a weekly window may reset days away — a bare
+  // time-of-day would read as "today" and steer the model to a wakeup that
+  // lands long before the actual reset.
   return (
     ` -- WIND DOWN: ${worst.label} window at ${worst.util}%. ` +
     `Finish current work; do NOT start new large tasks, agent fan-outs, or workflows. ` +
-    `Prefer ScheduleWakeup past ${fmtTime(worst.reset)} in loops.`
+    `Prefer ScheduleWakeup past ${fmtReset(worst)} in loops.`
   );
 }
 
@@ -345,28 +359,6 @@ export function buildToolBlockMessage(worst, now) {
     `Resets ${fmtWeekdayDateTime(worst.reset)}. ` +
     `Wrap up: summarize state for the user and end the turn. Do not retry tools.`
   );
-}
-
-/**
- * Generic block-message dispatcher used by callers/tests.
- * eventName decides which message family to build.
- */
-export function buildBlockMessage(worst, cfg, now, eventName) {
-  if (eventName === 'PreToolUse') return buildToolBlockMessage(worst, now);
-  return buildPromptBlockMessage(worst, cfg);
-}
-
-// ---------------------------------------------------------------------------
-// Token redaction helper (defense-in-depth for logs)
-// ---------------------------------------------------------------------------
-
-/**
- * Always returns the redaction sentinel. Used so that any accidental attempt to
- * stringify a token value through this helper yields '[redacted]' regardless of
- * input. Never returns the original value.
- */
-export function redactedToken(_value) {
-  return REDACTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,8 +405,14 @@ function makeDebugLogger(deps, cfg, tokenProbe) {
       }
       const line = JSON.stringify(entry);
       // Defense-in-depth: never write a line containing the token value.
+      // Check the JSON-escaped form too — stringify escapes quotes and
+      // backslashes, which would otherwise defeat a raw includes() check.
       const tok = tokenProbe ? tokenProbe() : null;
-      if (tok && line.includes(tok)) return;
+      if (tok) {
+        if (line.includes(tok)) return;
+        const escaped = JSON.stringify(tok).slice(1, -1);
+        if (escaped !== tok && line.includes(escaped)) return;
+      }
       // Synchronous append so the entry survives an imminent process.exit.
       // (Debug mode is opt-in diagnostics; sync I/O is acceptable here.)
       if (typeof deps.fs.appendFileSync === 'function') {
@@ -455,6 +453,8 @@ async function readTokenFromFile(deps) {
 /**
  * darwin: read token from Keychain via `security`. 3s timeout + kill.
  * Any error/timeout/empty => null (caller falls back to file).
+ * Absolute binary path: consistent with the poisoned-env threat model — a
+ * PATH-shadowed `security` must not be what we invoke.
  */
 async function readTokenFromKeychain(deps, log) {
   return new Promise((resolve) => {
@@ -466,7 +466,7 @@ async function readTokenFromKeychain(deps, log) {
     };
     try {
       const child = deps.execFileImpl(
-        'security',
+        '/usr/bin/security',
         ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
         { timeout: KEYCHAIN_TIMEOUT_MS, encoding: 'utf8', killSignal: 'SIGKILL' },
         (err, stdout) => {
@@ -500,7 +500,7 @@ async function readCache(deps) {
     const cachePath = joinPath(claudeDir(deps.homedir), CACHE_BASENAME);
     const text = await deps.fs.readFile(cachePath, 'utf8');
     const parsed = JSON.parse(text);
-    return validateCache(parsed);
+    return validateCache(parsed, deps.now().getTime());
   } catch {
     return null;
   }
@@ -511,18 +511,29 @@ async function readCache(deps) {
  * `clean` must already be a validated object.
  */
 async function writeCache(deps, clean, log) {
+  let tmpPath = null;
   try {
     const dir = claudeDir(deps.homedir);
     const cachePath = joinPath(dir, CACHE_BASENAME);
     // pid in the tmp name: UserPromptSubmit and PreToolUse hooks can run
     // concurrently in separate processes within the same millisecond.
     const pid = typeof deps.pid === 'number' ? deps.pid : 0;
-    const tmpPath = joinPath(dir, `${CACHE_BASENAME}.${pid}.${deps.now().getTime()}.tmp`);
+    tmpPath = joinPath(dir, `${CACHE_BASENAME}.${pid}.${deps.now().getTime()}.tmp`);
     const payload = JSON.stringify(clean);
     await deps.fs.writeFile(tmpPath, payload, { mode: 0o600 });
     await deps.fs.rename(tmpPath, cachePath);
   } catch {
     log('cache_write_failed', {});
+    // Best-effort cleanup: a failed rename (e.g. EPERM on Windows while the
+    // target is held open by a concurrent hook) must not leave .tmp files
+    // accumulating in ~/.claude.
+    if (tmpPath !== null && typeof deps.fs.unlink === 'function') {
+      try {
+        await deps.fs.unlink(tmpPath);
+      } catch {
+        // discard
+      }
+    }
   }
 }
 
@@ -581,7 +592,8 @@ function serializeUsageResponse(body, now) {
   // validateCache is the single source of truth: it allowlists known window
   // keys, validates each present entry (rejecting the whole response on any
   // malformed present window), and ignores unknown keys.
-  return validateCache({ fetchedAt: now.getTime(), failedAt: null, windows: body });
+  const nowMs = now.getTime();
+  return validateCache({ fetchedAt: nowMs, failedAt: null, windows: body }, nowMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -638,12 +650,13 @@ async function acquireData(deps, cfg, log, setProbe) {
   }
 
   // Fetch failed => write a negative-cache marker (preserving stale windows).
+  const failNowMs = deps.now().getTime();
   const marker = {
     fetchedAt: cached && cached.fetchedAt !== null ? cached.fetchedAt : null,
-    failedAt: deps.now().getTime(),
+    failedAt: failNowMs,
     windows: cached && cached.windows ? cached.windows : {},
   };
-  const cleanMarker = validateCache(marker);
+  const cleanMarker = validateCache(marker, failNowMs);
   if (cleanMarker) await writeCache(deps, cleanMarker, log);
   return cleanMarker;
 }
@@ -653,7 +666,13 @@ async function acquireData(deps, cfg, log, setProbe) {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse the hook input. Empty/malformed => UserPromptSubmit (manual invoke).
+ * Parse the hook input.
+ *  - Empty/absent stdin => UserPromptSubmit (manual invoke).
+ *  - Non-empty but unparseable => UnknownHookEvent: most likely a truncated
+ *    hook payload (e.g. stdin cut off by the read-grace timeout). The original
+ *    event is unknown and may have been PreToolUse, which must never produce
+ *    stdout — so main() keeps unknown events silent while still enforcing the
+ *    hard gate.
  */
 export function parseHookInput(text) {
   if (typeof text !== 'string') {
@@ -673,7 +692,7 @@ export function parseHookInput(text) {
     }
     return parsed;
   } catch {
-    return { hook_event_name: 'UserPromptSubmit' };
+    return { hook_event_name: 'UnknownHookEvent' };
   }
 }
 
@@ -684,7 +703,7 @@ export function parseHookInput(text) {
 /**
  * deps = {
  *   fetchImpl,
- *   fs (subset: readFile, writeFile, rename, appendFile [promises];
+ *   fs (subset: readFile, writeFile, rename, unlink, appendFile [promises];
  *       appendFileSync [sync, optional — used for debug log so it survives exit]),
  *   execFileImpl, platform, env, stdin (async () => text),
  *   stdout (fn), stderr (fn), now (() => Date), homedir (() => string),
@@ -756,9 +775,10 @@ export async function main(deps) {
       return;
     }
 
-    if (windows.length === 0) {
-      // Nothing to report; fail-soft silent.
-      log('ok', {});
+    if (windows.length === 0 || eventName !== 'UserPromptSubmit') {
+      // Nothing to report, or an unknown/truncated event. Unknown events may
+      // have been PreToolUse, whose contract forbids stdout — stay silent.
+      log(level === 'warn' ? 'warn' : 'ok', {});
       deps.exit(0);
       return;
     }
@@ -790,11 +810,25 @@ export async function main(deps) {
  * True only when this file is the process entry point (run directly), false
  * when imported. Compares the resolved path of import.meta.url against argv[1].
  * Importing the module in tests must execute nothing.
+ *
+ * Two traps the naive string compare falls into, both of which would silently
+ * disable the guard (fail-open hides the breakage):
+ *  - ESM resolves the entry point through symlinks (import.meta.url is the
+ *    realpath) while argv[1] keeps the symlink path — e.g. a symlinked plugin
+ *    install. Realpath both sides before comparing.
+ *  - Windows paths are case-insensitive (c:\ vs C:\) — case-fold on win32.
+ * The realpath call only happens when the cheap compare already failed AND the
+ * candidate entry has our basename, so importing this module stays I/O-free.
  */
 function runningDirectly() {
   try {
     if (!process.argv[1]) return false;
-    return fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const self = fileURLToPath(import.meta.url);
+    const entry = resolve(process.argv[1]);
+    if (norm(self) === norm(entry)) return true;
+    if (!norm(entry).endsWith('usage-guard.mjs')) return false;
+    return norm(realpathSync(entry)) === norm(realpathSync(self));
   } catch {
     return false;
   }
@@ -844,6 +878,7 @@ async function buildRealDeps() {
       readFile: fsp.readFile,
       writeFile: fsp.writeFile,
       rename: fsp.rename,
+      unlink: fsp.unlink,
       appendFile: fsp.appendFile,
       appendFileSync: fsSync.appendFileSync,
     },

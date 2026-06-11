@@ -210,6 +210,35 @@ describe('T3b — validateCache security (pure function tests)', () => {
   });
 
   // -------------------------------------------------------------------------
+  // T3b.16/17 Future timestamps distrusted (regression: audit #5 — a poisoned
+  // fetchedAt far in the future pinned the cache permanently "fresh")
+  // -------------------------------------------------------------------------
+  it('T3b.16 fetchedAt in the future → treated as absent (cache rejected when alone)', () => {
+    const raw = {
+      fetchedAt: FIXED_NOW_MS + 1_000_000_000, // far future
+      failedAt: null,
+      windows: { five_hour: { utilization: 50, resets_at: RESET_IN_3H } },
+    };
+    assert.equal(validateCache(raw, FIXED_NOW_MS), null,
+      'future fetchedAt with no failedAt must invalidate the cache');
+    // Without nowMs (legacy call shape) it still validates — distrust only
+    // applies when the caller supplies the clock.
+    assert.ok(validateCache(raw) !== null);
+  });
+
+  it('T3b.17 failedAt in the future → treated as absent (no pinned backoff)', () => {
+    const raw = {
+      fetchedAt: FIXED_NOW_MS - 1000,
+      failedAt: FIXED_NOW_MS + 1_000_000_000,
+      windows: {},
+    };
+    const result = validateCache(raw, FIXED_NOW_MS);
+    assert.ok(result !== null);
+    assert.equal(result.failedAt, null, 'future failedAt must be nulled');
+    assert.equal(result.fetchedAt, FIXED_NOW_MS - 1000, 'past fetchedAt survives');
+  });
+
+  // -------------------------------------------------------------------------
   // T3b.12 resets_at is normalised to ISO — verbatim string never in output
   // -------------------------------------------------------------------------
   it('T3b.12 valid cache with weird-but-parseable date: output uses reformatted date, not verbatim', () => {
@@ -255,7 +284,7 @@ describe('T3b — validateCache security (integration via main)', () => {
 
     const { fetchCalls, exits } = await runWithRawCache(badCache);
 
-    assert.ok(fetchCalls.length >= 1, 'bad cache should be treated as miss → fetch');
+    assert.equal(fetchCalls.length, 1, 'bad cache should be treated as miss → fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -305,5 +334,24 @@ describe('T3b — validateCache security (integration via main)', () => {
       assert.ok(!line.includes(scriptTag),
         `script tag must not appear in output: "${line}"`);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // T3b.18 Future fetchedAt on disk → treated as miss → refetch (integration)
+  // -------------------------------------------------------------------------
+  it('T3b.18 cache with far-future fetchedAt → not "fresh", fetch called', async () => {
+    const poisonedCache = JSON.stringify({
+      fetchedAt: FIXED_NOW_MS + 1_000_000_000, // would be "fresh" forever
+      failedAt: null,
+      windows: {
+        five_hour: { utilization: 99, resets_at: RESET_IN_3H },
+      },
+    });
+
+    const { fetchCalls, exits } = await runWithRawCache(poisonedCache);
+
+    assert.equal(fetchCalls.length, 1,
+      'future fetchedAt must not pin the cache fresh — refetch required');
+    assert.equal(exits[0], 0);
   });
 });

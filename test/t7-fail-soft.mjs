@@ -14,7 +14,7 @@
  *  - malformed API response → fail-soft
  *  - fs read throws → fail-soft
  *  - fs write throws → fail-soft (cache write error)
- *  - malformed stdin → UserPromptSubmit behaviour (fail-soft if no data)
+ *  - malformed stdin → UnknownHookEvent (silent fail-soft)
  *  - env garbage ("abc", "-5", "200", WARN>=HARD) → defaults used
  */
 
@@ -170,6 +170,7 @@ describe('T7 — Fail-soft', () => {
       },
       async writeFile() {},
       async rename() {},
+      async unlink() {},
       async appendFile() {},
       appendFileSync() {},
     };
@@ -189,9 +190,9 @@ describe('T7 — Fail-soft', () => {
   });
 
   // -------------------------------------------------------------------------
-  // T7.8 — malformed stdin (garbage) → treated as UserPromptSubmit, fail-soft
+  // T7.8 — malformed stdin (garbage) → UnknownHookEvent, silent fail-soft
   // -------------------------------------------------------------------------
-  it('T7.8 garbage stdin → treated as UserPromptSubmit (fail-soft, exit 0)', async () => {
+  it('T7.8 garbage stdin → UnknownHookEvent (silent fail-soft, exit 0)', async () => {
     const { deps, exits, stdout, stderr } = makeDeps({
       env: BASE_ENV,
       stdin: async () => '{{{{not json at all',

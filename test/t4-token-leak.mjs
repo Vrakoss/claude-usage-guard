@@ -9,13 +9,13 @@
  *  - All error paths (fetch throws, 401, 429, malformed JSON, fs write errors, keychain
  *    errors, debug mode ON) also never leak the token
  *
- * Also tests makeTokenHolder and redactedToken directly.
+ * Also tests makeTokenHolder directly.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
-import { main, makeTokenHolder, redactedToken } from '../scripts/usage-guard.mjs';
+import { main, makeTokenHolder } from '../scripts/usage-guard.mjs';
 import {
   makeDeps,
   makeCredsJson,
@@ -31,7 +31,7 @@ import {
 } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
-// makeTokenHolder / redactedToken unit tests
+// makeTokenHolder unit tests
 // ---------------------------------------------------------------------------
 
 describe('T4 — makeTokenHolder', () => {
@@ -60,12 +60,6 @@ describe('T4 — makeTokenHolder', () => {
     assert.ok(inspected.includes('[redacted]'));
   });
 
-  it('T4.0e redactedToken always returns "[redacted]" regardless of input', () => {
-    assert.equal(redactedToken(SENTINEL_TOKEN), '[redacted]');
-    assert.equal(redactedToken('any string'), '[redacted]');
-    assert.equal(redactedToken(null), '[redacted]');
-    assert.equal(redactedToken(undefined), '[redacted]');
-  });
 });
 
 // ---------------------------------------------------------------------------

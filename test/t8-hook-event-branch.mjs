@@ -5,7 +5,9 @@
  *  - {"hook_event_name":"PreToolUse","tool_name":"Bash"}  → PreToolUse behaviour
  *  - {"hook_event_name":"UserPromptSubmit"}               → UserPromptSubmit behaviour
  *  - empty stdin                                           → UserPromptSubmit behaviour
- *  - garbage stdin                                         → UserPromptSubmit behaviour
+ *  - garbage (non-empty unparseable) stdin                 → UnknownHookEvent:
+ *    silent (no stdout — the truncated payload may have been PreToolUse,
+ *    whose contract forbids stdout) but the hard gate still blocks.
  */
 
 import { describe, it } from 'node:test';
@@ -56,9 +58,19 @@ describe('T8 — parseHookInput (pure function)', () => {
     assert.equal(result.hook_event_name, 'UserPromptSubmit');
   });
 
-  it('T8.5 garbage/invalid JSON → UserPromptSubmit', () => {
+  it('T8.5 garbage/invalid JSON → UnknownHookEvent (silent event)', () => {
+    // Regression (audit #3): non-empty unparseable stdin is most likely a
+    // truncated hook payload — the original event may have been PreToolUse,
+    // so it must NOT default to the stdout-producing UserPromptSubmit.
     const result = parseHookInput('{{not json}}');
-    assert.equal(result.hook_event_name, 'UserPromptSubmit');
+    assert.equal(result.hook_event_name, 'UnknownHookEvent');
+  });
+
+  it('T8.5b truncated PreToolUse JSON → UnknownHookEvent', () => {
+    const full = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash' });
+    const truncated = full.slice(0, full.length - 12);
+    const result = parseHookInput(truncated);
+    assert.equal(result.hook_event_name, 'UnknownHookEvent');
   });
 
   it('T8.6 null input → UserPromptSubmit', () => {
@@ -185,9 +197,9 @@ describe('T8 — Hook event branch (integration via main)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // T8.14 Garbage stdin → UserPromptSubmit behaviour: stdout summary
+  // T8.14 Garbage stdin → silent: no stdout (payload may have been PreToolUse)
   // -------------------------------------------------------------------------
-  it('T8.14 garbage stdin → UserPromptSubmit behaviour: stdout summary', async () => {
+  it('T8.14 garbage stdin (ok level) → NO stdout, exit 0 (unknown event stays silent)', async () => {
     const { deps, stdout, stderr, exits } = makeDeps({
       env: ENV,
       stdin: async () => 'not json at all !!!',
@@ -201,8 +213,34 @@ describe('T8 — Hook event branch (integration via main)', () => {
     await main(deps);
 
     assert.equal(exits[0], 0);
-    assert.equal(stdout.length, 1);
-    assert.ok(stdout[0].includes('[usage]'));
+    // Regression (audit #3): a truncated PreToolUse payload routed through the
+    // UserPromptSubmit branch used to emit a stdout summary — violating the
+    // "PreToolUse must never write stdout" contract.
+    assert.equal(stdout.length, 0, 'unknown/truncated event must not write stdout');
+    assert.equal(stderr.length, 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T8.14b Garbage stdin at HARD level → still blocked (gate not bypassable
+  // by feeding the hook unparseable stdin)
+  // -------------------------------------------------------------------------
+  it('T8.14b garbage stdin at HARD level → stderr block, exit 2, zero stdout', async () => {
+    const { deps, stdout, stderr, exits } = makeDeps({
+      env: ENV,
+      stdin: async () => 'not json at all !!!',
+      initialFs: {
+        [CACHE_PATH]: makeHardCache(),
+        [CREDS_PATH]: makeCredsJson('tok'),
+      },
+      now: () => new Date(FIXED_NOW_MS),
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 2, 'hard gate must still block on unknown events');
+    assert.equal(stdout.length, 0);
+    assert.equal(stderr.length, 1);
+    assert.ok(stderr[0].includes('QUOTA GUARD'));
   });
 
   // -------------------------------------------------------------------------

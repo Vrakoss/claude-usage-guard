@@ -2,7 +2,9 @@
  * T5 — Credentials acquisition
  *
  * win32 + linux: reads ~/.claude/.credentials.json (assert via fs recorder + homedir injection)
- * darwin:        execFile called with ['find-generic-password','-s','Claude Code-credentials','-w']
+ * darwin:        execFile called as /usr/bin/security (absolute path — PATH must not
+ *                decide what we invoke) with
+ *                ['find-generic-password','-s','Claude Code-credentials','-w']
  * darwin keychain error → file fallback
  * darwin keychain timeout → file fallback
  * both missing → fail-soft exit 0, empty stdout, empty stderr
@@ -81,7 +83,7 @@ describe('T5 — Credentials', () => {
     assert.ok(credsRead.path.includes(customHome), 'creds path must use injected homedir');
 
     // Fetch should have been called (proving the token was found and used).
-    assert.ok(fetchCalls.length >= 1, 'fetch should be called when creds are found');
+    assert.equal(fetchCalls.length, 1, 'fetch should be called exactly once when creds are found');
   });
 
   // -------------------------------------------------------------------------
@@ -114,13 +116,13 @@ describe('T5 — Credentials', () => {
     const normRead = credsRead.path.replace(/\\/g, '/');
     assert.ok(normRead.includes('C:/Users/WinUser'), 'must use injected homedir');
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
   });
 
   // -------------------------------------------------------------------------
   // T5.3 darwin: execFile called with correct security arguments
   // -------------------------------------------------------------------------
-  it('T5.3 darwin: execFile called with find-generic-password args', async () => {
+  it('T5.3 darwin: execFile called as /usr/bin/security with find-generic-password args', async () => {
     const { deps, execCalls, exits } = makeDeps({
       env: ENV_ALWAYS_STALE,
       stdin: async () => UPS,
@@ -139,9 +141,11 @@ describe('T5 — Credentials', () => {
 
     await main(deps);
 
-    assert.ok(execCalls.length >= 1, 'execFile should be called on darwin');
+    assert.equal(execCalls.length, 1, 'execFile should be called exactly once on darwin');
     const keychainCall = execCalls[0];
-    assert.equal(keychainCall.cmd, 'security');
+    // Regression (audit #6): absolute path so a PATH-shadowed `security`
+    // binary is never what we invoke.
+    assert.equal(keychainCall.cmd, '/usr/bin/security');
     assert.ok(Array.isArray(keychainCall.args));
     assert.ok(keychainCall.args.includes('find-generic-password'));
     assert.ok(keychainCall.args.includes('-s'));
@@ -174,7 +178,7 @@ describe('T5 — Credentials', () => {
     await main(deps);
 
     // Fetch must have been called (file fallback worked).
-    assert.ok(fetchCalls.length >= 1, 'file fallback should allow fetch');
+    assert.equal(fetchCalls.length, 1, 'file fallback should allow fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -202,7 +206,7 @@ describe('T5 — Credentials', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'file fallback after timeout should allow fetch');
+    assert.equal(fetchCalls.length, 1, 'file fallback after timeout should allow fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -272,7 +276,7 @@ describe('T5 — Credentials', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'empty keychain output → file fallback → fetch');
+    assert.equal(fetchCalls.length, 1, 'empty keychain output → file fallback → fetch');
     assert.equal(exits[0], 0);
   });
 
@@ -299,7 +303,7 @@ describe('T5 — Credentials', () => {
 
     await main(deps);
 
-    assert.ok(fetchCalls.length >= 1, 'SIGKILL fallback → fetch');
+    assert.equal(fetchCalls.length, 1, 'SIGKILL fallback → fetch');
     assert.equal(exits[0], 0);
   });
 });

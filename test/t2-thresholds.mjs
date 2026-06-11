@@ -317,6 +317,28 @@ describe('T2 — Threshold matrix', () => {
   });
 
   // -------------------------------------------------------------------------
+  // T2.15 — WARN suffix for a weekly window includes the reset DATE, not a
+  // bare time-of-day (regression: audit #2 — "past 19:00" for a reset days
+  // away steered the model to a wakeup long before the actual reset)
+  // -------------------------------------------------------------------------
+  it('T2.15 7d WARN suffix: ScheduleWakeup hint includes weekday+date, not bare time', async () => {
+    const { stdout, exits } = await runWith7dWindow({
+      util: WARN,
+      eventStdin: UPS,
+      resetIso: RESET_IN_8H,
+    });
+
+    assert.equal(exits[0], 0);
+    const line = stdout[0];
+    assert.ok(line.includes('WIND DOWN'));
+    const suffix = line.slice(line.indexOf('WIND DOWN'));
+    // Timezone-safe: assert month name + HH:MM shape, never exact weekday/day.
+    assert.ok(suffix.includes('Nov'), `suffix must carry the reset date: "${suffix}"`);
+    assert.ok(/ScheduleWakeup past \S+ \d{1,2} Nov \d{2}:\d{2}/.test(suffix),
+      `suffix must use weekday+date+time for weekly windows: "${suffix}"`);
+  });
+
+  // -------------------------------------------------------------------------
   // T2.14 — UserPromptSubmit block message contains formatted reset time, not raw ISO
   // -------------------------------------------------------------------------
   it('T2.14 UserPromptSubmit block: stderr message contains HH:MM formatted time, not raw ISO', async () => {

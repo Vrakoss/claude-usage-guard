@@ -54,7 +54,7 @@ describe('T9 — URL hardening', () => {
   it('T9.1 CLAUDE_USAGE_GUARD_URL=evil does not redirect fetch', async () => {
     const { fetchCalls } = await runWithEnv({ CLAUDE_USAGE_GUARD_URL: EVIL_URL });
 
-    assert.ok(fetchCalls.length >= 1, 'should have fetched');
+    assert.equal(fetchCalls.length, 1, 'should have fetched exactly once');
     for (const call of fetchCalls) {
       assert.equal(call.url, EXPECTED_URL,
         `fetch URL must be hardcoded, got: ${call.url}`);
@@ -67,7 +67,7 @@ describe('T9 — URL hardening', () => {
   it('T9.2 ANTHROPIC_BASE_URL=evil does not redirect fetch', async () => {
     const { fetchCalls } = await runWithEnv({ ANTHROPIC_BASE_URL: EVIL_URL });
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
     for (const call of fetchCalls) {
       assert.equal(call.url, EXPECTED_URL);
     }
@@ -79,7 +79,7 @@ describe('T9 — URL hardening', () => {
   it('T9.3 USAGE_URL=evil does not redirect fetch', async () => {
     const { fetchCalls } = await runWithEnv({ USAGE_URL: EVIL_URL });
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
     for (const call of fetchCalls) {
       assert.equal(call.url, EXPECTED_URL);
     }
@@ -91,7 +91,7 @@ describe('T9 — URL hardening', () => {
   it('T9.4 ANTHROPIC_API_URL=evil does not redirect fetch', async () => {
     const { fetchCalls } = await runWithEnv({ ANTHROPIC_API_URL: EVIL_URL });
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
     for (const call of fetchCalls) {
       assert.equal(call.url, EXPECTED_URL);
     }
@@ -110,7 +110,7 @@ describe('T9 — URL hardening', () => {
       BASE_URL: EVIL_URL,
     });
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
     for (const call of fetchCalls) {
       assert.equal(call.url, EXPECTED_URL,
         `Expected hardcoded URL, got: ${call.url}`);
@@ -143,7 +143,7 @@ describe('T9 — URL hardening', () => {
   it('T9.7 fetch URL is exactly the hardcoded constant — no appended path', async () => {
     const { fetchCalls } = await runWithEnv({});
 
-    assert.ok(fetchCalls.length >= 1);
+    assert.equal(fetchCalls.length, 1);
     // Must be exactly equal, not just starts-with.
     assert.equal(fetchCalls[0].url, EXPECTED_URL,
       'URL must be exactly the hardcoded constant');
