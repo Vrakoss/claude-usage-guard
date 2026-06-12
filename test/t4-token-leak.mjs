@@ -362,10 +362,134 @@ describe('T4 — Token leak guard (integration)', () => {
     await main(deps);
 
     assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.10 hard-block:');
+    // Positive control: the token DID go out — exactly once, in the Auth header.
+    const authCount = assertTokenInAuthHeaderOnly(fetchCalls, 'T4.10 hard-block:');
+    assert.equal(authCount, 1, 'sentinel should appear in exactly one Auth header');
     assert.equal(exits[0], 2);
     // Block message in stderr must not contain sentinel.
     for (const line of stderr) {
       assert.ok(!line.includes(SENTINEL_TOKEN));
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // T4.11 — darwin + debug ON, keychain returns JSON blob with sentinel token
+  // -------------------------------------------------------------------------
+  it('T4.11 darwin + debug ON: keychain JSON blob with sentinel → no leak in any channel, Auth header only', async () => {
+    const { deps, stdout, stderr, exits, fetchCalls, fakeFs } = makeDeps({
+      env: { ...ENV, CLAUDE_USAGE_GUARD_DEBUG: '1' },
+      stdin: async () => UPS,
+      platform: 'darwin',
+      // No creds file — token comes from keychain blob only.
+      initialFs: {},
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, makeCredsJson(SENTINEL_TOKEN) + '\n');
+        return { on() {} };
+      },
+      fetchImpl: async () => ({
+        status: 200,
+        async json() {
+          return { five_hour: { utilization: 30, resets_at: RESET_IN_3H } };
+        },
+      }),
+    });
+
+    await main(deps);
+
+    assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.11 darwin-blob-debug:');
+    const authCount = assertTokenInAuthHeaderOnly(fetchCalls, 'T4.11 darwin-blob-debug:');
+    assert.equal(authCount, 1, 'sentinel should appear in exactly one Auth header');
+    assert.equal(exits[0], 0);
+
+    // Debug log must contain neither the sentinel nor the key name 'claudeAiOauth'.
+    const debugContent = fakeFs._peek(DEBUG_LOG_PATH) ?? '';
+    assert.ok(!debugContent.includes(SENTINEL_TOKEN),
+      'debug log must not contain sentinel token');
+    assert.ok(!debugContent.includes('claudeAiOauth'),
+      'debug log must not contain credentials key name');
+
+    // Invariant 2 (behavioral): the refresh credential carried in the blob must
+    // never reach any channel — extractAccessToken reads only accessToken.
+    for (const line of [...stdout, ...stderr]) {
+      assert.ok(!line.includes('do-not-read'), 'refresh credential must not leak');
+    }
+    assert.ok(!debugContent.includes('do-not-read'),
+      'debug log must not contain the refresh credential value');
+  });
+
+  // -------------------------------------------------------------------------
+  // T4.12 — debug + hard-blocked + ScheduleWakeup (new JSON-stdout path):
+  //         sentinel must not appear in the JSON stdout channel
+  // -------------------------------------------------------------------------
+  it('T4.12 debug + hard-blocked + ScheduleWakeup JSON-stdout: sentinel never in JSON stdout', async () => {
+    // This exercises the new PreToolUse/ScheduleWakeup path that emits a single
+    // JSON line on stdout (updatedInput with stamped prompt). The sentinel token
+    // must not appear in that JSON line.
+    const { deps, stdout, stderr, exits, fetchCalls, fakeFs } = makeDeps({
+      env: { ...ENV, CLAUDE_USAGE_GUARD_DEBUG: '1' },
+      stdin: async () => JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'ScheduleWakeup',
+        tool_input: {
+          delaySeconds: 3600,
+          prompt: 'resume my analysis task',
+          reason: 'quota guard wakeup',
+        },
+      }),
+      initialFs: makeCredsFs(),
+      now: () => new Date(FIXED_NOW_MS),
+      fetchImpl: async () => ({
+        status: 200,
+        async json() {
+          return { five_hour: { utilization: 99, resets_at: RESET_IN_3H } };
+        },
+      }),
+    });
+
+    await main(deps);
+
+    // ScheduleWakeup path: always exit 0.
+    assert.equal(exits[0], 0, 'ScheduleWakeup must exit 0');
+
+    // Sentinel must not appear in any recorded channel.
+    assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.12 schedule-wakeup-json:');
+
+    // Verify no fetch happened on this path (cache-only block detection).
+    // The sentinel creds file exists but should NOT be read on this path.
+    // fetchCalls should be empty because cache is warm (TTL 3600, cache fresh).
+    assert.equal(fetchCalls.length, 0, 'no fetch on ScheduleWakeup path');
+
+    // If stdout was emitted (JSON line), verify it contains no sentinel.
+    for (const line of stdout) {
+      assert.ok(
+        !line.includes(SENTINEL_TOKEN),
+        `JSON stdout must not contain sentinel token: "${line.slice(0, 200)}"`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // T4.13 — SessionStart with sentinel token in creds: never reads creds,
+  //         token must not appear in any recorded channel
+  // -------------------------------------------------------------------------
+  it('T4.13 SessionStart + sentinel in creds file → sentinel appears in NO channel', async () => {
+    // SessionStart must never read credentials or fetch. This test seeds the
+    // creds file with the sentinel and verifies it never leaks — pinning the
+    // no-read invariant against future drift.
+    const { deps, stdout, stderr, exits, fetchCalls, fakeFs } = makeDeps({
+      env: {},
+      platform: 'linux',
+      stdin: async () =>
+        JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', session_id: 's1' }),
+      initialFs: makeCredsFs(), // sentinel in creds
+      now: () => new Date(FIXED_NOW_MS),
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 0, 'SessionStart must exit 0');
+    assert.equal(fetchCalls.length, 0, 'must not fetch on SessionStart');
+    assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.13 session-start:');
   });
 });

@@ -43,7 +43,10 @@ Reset times are shown in your **local timezone** with fixed English labels, e.g.
 | `UserPromptSubmit` | worst `< WARN` | Prints a one-line `[usage] …` status to context | `0` |
 | `UserPromptSubmit` | `WARN ≤` worst `< HARD` | Status line **+ WIND DOWN** advisory (finish current work, don't start big tasks) | `0` |
 | `UserPromptSubmit` | worst `≥ HARD` | **Blocks the prompt**; stderr explains when it resets and how to bypass | `2` |
-| `PreToolUse` | tool is `ScheduleWakeup` | **Exempt** — always allowed (so the model can sleep through the reset) | `0` |
+| `PreToolUse` | tool is `ScheduleWakeup` | **Exempt** — always allowed (exit 2 is never possible). When hard-blocked, the guard stamps `[usage-guard:resume]` onto the wakeup prompt via `updatedInput` so the wake turn is recognized as a resume hop | `0` |
+| `UserPromptSubmit` | prompt starts with `[usage-guard:resume]`, still blocked, reset ≤ 6h | Allowed through; re-instructs the model to reschedule with same prompt + computed delay | `0` |
+| `UserPromptSubmit` | prompt starts with `[usage-guard:resume]`, still blocked, reset > 6h | Allowed through; instructs chain termination (summarize + end turn, no multi-day reschedule) | `0` |
+| `UserPromptSubmit` | prompt starts with `[usage-guard:resume]`, window has reset | Allowed through; appends resume-ready suffix telling the model to resume the task | `0` |
 | `PreToolUse` | worst `< HARD` | Allowed silently (no stdout, per hook contract) | `0` |
 | `PreToolUse` | worst `≥ HARD`, reset **≤ 6h** away | **Blocks the tool**; instructs the model to call `ScheduleWakeup` until reset, then resume | `2` |
 | `PreToolUse` | worst `≥ HARD`, reset **> 6h** away | **Blocks the tool**; instructs the model to wrap up, summarize, and end the turn | `2` |
@@ -59,6 +62,32 @@ trapped — it can always schedule its own wakeup.
 For a **weekly** window (reset more than 6 hours out), self-sleeping is pointless, so the
 guard instead tells the model to summarize state for you and end the turn cleanly.
 
+**How the resume chain works:** A `ScheduleWakeup` fired by Claude Code re-enters as a
+`UserPromptSubmit` with the same prompt text. The guard recognizes prompts that start with
+`[usage-guard:resume]` as resume hops and lets them through the hard gate (exit 0 instead
+of exit 2). To ensure wakeup prompts carry the marker, the guard stamps it automatically:
+when a `ScheduleWakeup` is dispatched while hard-blocked, the guard intercepts the
+`PreToolUse` hook, adds `[usage-guard:resume] ` to the front of the prompt via
+`updatedInput`, and then exits 0. On each subsequent hop, the guard checks whether the
+window has reset:
+- **Still blocked (≤ 6h to reset):** re-instructs the model to reschedule with the same
+  marked prompt and the computed delay; all other tools remain gated.
+- **Still blocked (> 6h to reset):** instructs chain termination — summarize the task
+  state for the user and end the turn; do not reschedule for days.
+- **Window has reset** (dropped by `parseWindows` because `resets_at` is now in the
+  past): appends a resume-ready suffix telling the model to resume the task described
+  in the prompt and relaunch any aborted sub-agents.
+
+#### Sub-agents abort — capture resume state
+
+Sub-agents (detected via the `agent_id` field in the `PreToolUse` hook input) cannot call
+`ScheduleWakeup` — it is only available on the main agent thread. When a sub-agent is
+hard-blocked, the guard instructs it to **abort immediately** and return a resume brief to
+its caller: current state, remaining steps, and exact relaunch instructions (context, tool
+calls, arguments). The caller embeds this brief in the wakeup prompt
+(after `[usage-guard:resume]`) so the sub-agent can be relaunched fresh after reset with
+full context.
+
 ## Install
 
 ```text
@@ -73,6 +102,15 @@ needs Node, so this is normally satisfied).
 **Verify:** start a new session and submit any prompt. A `[usage] 5h: N% …` line
 should appear in context. No line = guard failed open (missing creds / network /
 Node) — set `CLAUDE_USAGE_GUARD_DEBUG=1` and check the debug log.
+
+On the **first session after install** the guard posts a one-time setup note into
+the session context explaining the active defaults and the settings.json env block
+to customize them. You can just ask Claude to apply the suggested config for you —
+it will add the env block to your `~/.claude/settings.json`.
+
+> **macOS:** The first run may show a Keychain permission prompt for
+> `Claude Code-credentials`. Choose **Always Allow** so the guard can read your
+> OAuth token without prompting on every hook invocation.
 
 ## Configuration
 
@@ -148,6 +186,13 @@ cannot leak through the usual exfiltration channels:
 - **Zero dependencies.** The script uses only Node built-ins and global `fetch`. There is
   no third-party supply-chain surface. CI asserts `package.json` declares no
   `dependencies` or `devDependencies`.
+- **`[usage-guard:resume]` marker is a routing tag, not a security boundary.** The marker
+  bypasses *only* the prompt gate (it lets a `UserPromptSubmit` through instead of
+  blocking it). It does **not** bypass the tool gate — a resume-hop turn still has every
+  `PreToolUse` hook enforced normally. A malicious prompt containing the marker prefix
+  would be let through at the `UserPromptSubmit` level (producing a hop-suffix in model
+  context instead of a hard block), but it cannot use any blocked tool. The guard trusts
+  the prompt gate only for routing; tool execution remains gated independently.
 
 ## Disclaimer
 
@@ -185,6 +230,7 @@ You can also delete the local artifacts the guard creates:
 
 - `~/.claude/usage-guard-cache.json`
 - `~/.claude/usage-guard-debug.log` (only if you enabled debug mode)
+- `~/.claude/usage-guard-onboarded` (onboarding marker — delete to re-trigger the setup note)
 
 ## License
 

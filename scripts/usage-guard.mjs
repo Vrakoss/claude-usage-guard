@@ -1,4 +1,4 @@
-﻿// claude-usage-guard — deterministic hook-enforced subscription-quota guard.
+// claude-usage-guard — deterministic hook-enforced subscription-quota guard.
 // Single-file, zero-dependency (node: builtins + global fetch). Node >= 18.
 //
 // SECURITY POSTURE (read before editing):
@@ -14,6 +14,27 @@
 //    numbers and freshly re-formatted parsed Dates.
 //  - Every unexpected error => exit 0 with empty output (fail-soft / fail-open).
 //    Caught error objects are discarded, never stringified into output.
+//  - PreToolUse hook contract amendment (v0.3.0): the ScheduleWakeup-exempt
+//    branch may emit exactly ONE JSON line on stdout when it stamps a resume
+//    marker onto an unmarked wakeup prompt while hard-blocked. All other
+//    PreToolUse paths produce zero stdout. The JSON shape is strictly allowlisted
+//    (permissionDecision, permissionDecisionReason, updatedInput with only
+//    delaySeconds/prompt/reason fields). Any deviation falls back to plain exit 0.
+//
+// HOOK CONTRACT (v0.4.0):
+//  - SessionStart: exit 0 always. Stdout posts a one-time onboarding hint (built
+//    only from constants + platform branch) when not yet onboarded and no
+//    CLAUDE_USAGE_GUARD* env var is set. Never fetches, never reads credentials,
+//    never exits 2.
+//  - UserPromptSubmit: exit 0 = allow (may print [usage] summary to stdout);
+//    exit 2 + stderr = block. The [usage-guard:resume] prefix identifies a
+//    scheduled resume wakeup; the guard lets these through the prompt gate,
+//    re-instructs reschedule-or-resume each hop.
+//  - PreToolUse: exit 0 = allow; exit 2 + stderr = block. NEVER exit 2 on the
+//    ScheduleWakeup path (so the model can never be trapped). The ScheduleWakeup
+//    path may stamp the RESUME_MARKER onto an unmarked wakeup prompt (one JSON
+//    line stdout) when hard-blocked, to ensure the wake turn is recognized as
+//    a resume hop and handled correctly by the UserPromptSubmit branch.
 //
 // TESTABILITY: all I/O is injected through `main(deps)`. Pure helpers are
 // exported. Importing this module performs no I/O and exits nothing.
@@ -45,6 +66,7 @@ const DEFAULT_TTL_S = 60;
 const CACHE_BASENAME = 'usage-guard-cache.json';
 const DEBUG_BASENAME = 'usage-guard-debug.log';
 const CREDS_BASENAME = '.credentials.json';
+const ONBOARD_BASENAME = 'usage-guard-onboarded';
 
 // Window keys we understand, mapped to display labels.
 const WINDOW_LABELS = {
@@ -72,9 +94,35 @@ const DEBUG_EVENTS = new Set([
   'ok',
   'unexpected',
   'cache_write_failed',
+  'resume_hop',
+  'wakeup_marked',
+  'onboarding',
 ]);
 
 const REDACTED = '[redacted]';
+
+// ---------------------------------------------------------------------------
+// Resume-hop marker — COMPATIBILITY CONTRACT: this string must never change.
+// It identifies a UserPromptSubmit that was injected by a ScheduleWakeup
+// fired during a hard-block. The guard lets these through the prompt gate
+// and re-instructs the model to reschedule or resume depending on state.
+// ---------------------------------------------------------------------------
+
+/**
+ * Marker prefix stamped onto wakeup prompts by the ScheduleWakeup hook path
+ * when the guard is hard-blocked. NEVER change this string — it is a
+ * compatibility contract across plugin versions.
+ */
+export const RESUME_MARKER = '[usage-guard:resume]';
+
+/**
+ * Sentinel strings used by the Claude Code harness for autonomous loop
+ * scheduling. These must never be rewritten by the guard.
+ */
+const AUTONOMOUS_SENTINELS = new Set([
+  '<<autonomous-loop-dynamic>>',
+  '<<autonomous-loop>>',
+]);
 
 // ---------------------------------------------------------------------------
 // Token hygiene — opaque holder
@@ -314,6 +362,38 @@ export function formatSummary(windows) {
 }
 
 // ---------------------------------------------------------------------------
+// Resume-hop helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true iff the input is a UserPromptSubmit whose prompt text starts
+ * with RESUME_MARKER. Strict startsWith — mid-prompt occurrences do NOT count.
+ * Non-string prompts are treated as normal prompts (not resume hops).
+ */
+export function isResumeHopPrompt(input) {
+  return (
+    input.hook_event_name === 'UserPromptSubmit' &&
+    typeof input.prompt === 'string' &&
+    input.prompt.startsWith(RESUME_MARKER)
+  );
+}
+
+/**
+ * Compute the ScheduleWakeup delaySeconds for a resume hop.
+ * Clamps to [60, 3600] (harness limits). The +120s buffer ensures the
+ * wakeup lands after the reset, not at the exact second.
+ */
+export function computeHopDelaySeconds(worst, now) {
+  return Math.max(
+    60,
+    Math.min(
+      3600,
+      Math.ceil((worst.reset.getTime() - now.getTime()) / 1000) + 120,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Block / warn messages
 // ---------------------------------------------------------------------------
 
@@ -322,7 +402,8 @@ export function buildPromptBlockMessage(worst, cfg) {
   return (
     `QUOTA GUARD: ${worst.label} window at ${worst.util}% (limit ${cfg.hard}%). ` +
     `Prompts blocked until reset at ${fmtWeekdayDateTime(worst.reset)} local. ` +
-    `Bypass: set CLAUDE_USAGE_GUARD=off.`
+    `Bypass: set CLAUDE_USAGE_GUARD=off. ` +
+    `Scheduled resume wakeups (prefixed ${RESUME_MARKER}) are exempt and will still fire.`
   );
 }
 
@@ -339,25 +420,124 @@ export function buildWarnSuffix(worst) {
 }
 
 /**
- * PreToolUse HARD block message (stderr). Behavior depends on time-to-reset.
- * `now` is a Date.
+ * PreToolUse HARD block message (stderr). Behavior depends on time-to-reset
+ * and whether we are in a sub-agent.
+ * `now` is a Date, `isSubagent` is a boolean.
  */
-export function buildToolBlockMessage(worst, now) {
+export function buildToolBlockMessage(worst, now, isSubagent) {
   const msToReset = worst.reset.getTime() - now.getTime();
   const sixHoursMs = 6 * 60 * 60 * 1000;
-  if (msToReset <= sixHoursMs) {
+  if (isSubagent) {
     return (
       `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
-      `Execution paused until reset at ${fmtTime(worst.reset)}. ` +
-      `Call ScheduleWakeup with delaySeconds until then ` +
-      `(chain 3600s wakeups if needed; ScheduleWakeup is exempt from this gate). ` +
-      `After reset, resume the task. Do not retry other tools before reset.`
+      `You are a sub-agent: ScheduleWakeup is NOT available here. ` +
+      `All tools are gated. STOP now — return a resume brief to your caller: ` +
+      `summarize current state, remaining steps, and exact relaunch instructions ` +
+      `(context, tool calls, arguments). Your caller will relaunch you after reset.`
+    );
+  }
+  if (msToReset <= sixHoursMs) {
+    const delay = computeHopDelaySeconds(worst, now);
+    return (
+      `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
+      `Execution paused until reset at ${fmtReset(worst)}. ` +
+      `Your ONLY next action: call ScheduleWakeup (exempt from this gate) with ` +
+      `delaySeconds=${delay} and a prompt STARTING WITH ${RESUME_MARKER} followed by ` +
+      `a one-line resume brief (task to resume; which sub-agents to relaunch with what context — ` +
+      `sub-agents abort on block and need fresh launch). ` +
+      `The guard lets that wakeup back through each hop and tells you whether to ` +
+      `reschedule or resume. Then end the turn. Do not retry other tools before reset.`
     );
   }
   return (
     `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
     `Resets ${fmtWeekdayDateTime(worst.reset)}. ` +
-    `Wrap up: summarize state for the user and end the turn. Do not retry tools.`
+    `Wrap up: summarize state for the user and end the turn (include a resume brief in your summary). Do not retry tools.`
+  );
+}
+
+/**
+ * Suffix appended to the UserPromptSubmit stdout line when a resume-hop is
+ * still blocked (window not yet reset). Instructs the model to reschedule the
+ * next hop; the hop delay is computed internally via computeHopDelaySeconds.
+ */
+export function buildResumeHopSuffix(worst, now) {
+  const delay = computeHopDelaySeconds(worst, now);
+  return (
+    ` -- RESUME HOP: ${worst.label} still at ${worst.util}% (reset ${fmtReset(worst)}). ` +
+    `Still blocked. Your ONLY action: call ScheduleWakeup with delaySeconds=${delay} ` +
+    `and the SAME prompt (starting with ${RESUME_MARKER}), then end the turn. ` +
+    `All other tools are gated/denied.`
+  );
+}
+
+/**
+ * Suffix appended to the UserPromptSubmit stdout line when a resume-hop
+ * prompt arrives after the window has reset (dropped by parseWindows because
+ * resets_at is now in the past, or utilization fell below hard threshold).
+ * Instructs the model to resume the task described in the prompt.
+ */
+export function buildResumeReadySuffix() {
+  return (
+    ` -- RESUME READY: quota window has reset. ` +
+    `RESUME the task described in this prompt now. ` +
+    `Relaunch any aborted sub-agents fresh with a context brief.`
+  );
+}
+
+/**
+ * Suffix appended to the UserPromptSubmit stdout line when a resume-hop is
+ * still hard-blocked but the worst window does not reset for more than 6 hours.
+ * A multi-hour wakeup chain is inappropriate at that horizon — instruct the
+ * model to wind the chain down and hand back to the user instead of sleeping
+ * for days.
+ */
+export function buildResumeTerminationSuffix(worst) {
+  return (
+    ` -- RESUME HOP: ${worst.label} window does not reset for more than 6 hours ` +
+    `(${fmtWeekdayDateTime(worst.reset)} local). ` +
+    `Do NOT reschedule for days. Summarize the task state for the user and end the turn cleanly.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * True if any CLAUDE_USAGE_GUARD* env var is set to a non-empty value.
+ * Prefix scan (not a fixed list) so future config vars suppress automatically.
+ */
+export function isConfigured(env) {
+  return Object.keys(env).some(
+    (k) => k.startsWith('CLAUDE_USAGE_GUARD') && String(env[k] ?? '') !== '',
+  );
+}
+
+/**
+ * One-time onboarding hint posted to SessionStart stdout.
+ * Built only from DEFAULT_WARN/DEFAULT_HARD constants + a platform branch.
+ * Contains no credentials, no dates, no user data.
+ */
+export function buildOnboardingMessage(platform) {
+  const credLine =
+    platform === 'darwin'
+      ? `Credentials: read from the macOS Keychain item "Claude Code-credentials" (a one-time ` +
+        `Keychain permission prompt may appear — choose "Always Allow"), falling back to ` +
+        `~/.claude/.credentials.json.`
+      : `Credentials: read from ~/.claude/.credentials.json.`;
+  return (
+    `[usage-guard] One-time setup note (will not repeat):\n` +
+    `Active defaults: WARN at ${DEFAULT_WARN}%, HARD block at ${DEFAULT_HARD}%.\n` +
+    `To customize, add an env block to ~/.claude/settings.json:\n` +
+    `  "env": {\n` +
+    `    "CLAUDE_USAGE_GUARD_WARN": "${DEFAULT_WARN}",\n` +
+    `    "CLAUDE_USAGE_GUARD_HARD": "${DEFAULT_HARD}"\n` +
+    `  }\n` +
+    `Optional: CLAUDE_USAGE_GUARD_TTL (cache seconds), CLAUDE_USAGE_GUARD_DEBUG=1 (diagnostics), ` +
+    `CLAUDE_USAGE_GUARD=off (disable). Env reloads at next session start.\n` +
+    `${credLine}\n` +
+    `If the user wants different thresholds, offer to add the env block above to their settings.json.`
   );
 }
 
@@ -432,6 +612,18 @@ function makeDebugLogger(deps, cfg, tokenProbe) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Extract the access token from a parsed credentials object.
+ * Reads ONLY `.claudeAiOauth.accessToken` — the refresh credential on the
+ * same record is never accessed. Returns the raw token string or null.
+ */
+function extractAccessToken(parsed) {
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.claudeAiOauth)) return null;
+  const token = parsed.claudeAiOauth.accessToken;
+  if (typeof token !== 'string' || token.length === 0) return null;
+  return token;
+}
+
+/**
  * Read access token from the credentials file. Returns raw string or null.
  * Reads ONLY `.claudeAiOauth.accessToken`. The refresh credential on the same
  * record is never accessed.
@@ -440,11 +632,7 @@ async function readTokenFromFile(deps) {
   try {
     const credsPath = joinPath(claudeDir(deps.homedir), CREDS_BASENAME);
     const text = await deps.fs.readFile(credsPath, 'utf8');
-    const parsed = JSON.parse(text);
-    if (!isPlainObject(parsed) || !isPlainObject(parsed.claudeAiOauth)) return null;
-    const token = parsed.claudeAiOauth.accessToken;
-    if (typeof token !== 'string' || token.length === 0) return null;
-    return token;
+    return extractAccessToken(JSON.parse(text));
   } catch {
     return null;
   }
@@ -455,6 +643,12 @@ async function readTokenFromFile(deps) {
  * Any error/timeout/empty => null (caller falls back to file).
  * Absolute binary path: consistent with the poisoned-env threat model — a
  * PATH-shadowed `security` must not be what we invoke.
+ *
+ * macOS Claude Code stores the full credentials JSON blob as the Keychain item
+ * password (issue #2). When the output starts with '{' it is treated as JSON
+ * and the access token is extracted from it; bare strings are returned as-is
+ * (historical contract). Corrupt blobs => null so the file fallback gets its
+ * chance.
  */
 async function readTokenFromKeychain(deps, log) {
   return new Promise((resolve) => {
@@ -478,7 +672,28 @@ async function readTokenFromKeychain(deps, log) {
             return;
           }
           const out = typeof stdout === 'string' ? stdout.trim() : '';
-          done(out.length > 0 ? out : null);
+          if (out.length === 0) {
+            done(null);
+            return;
+          }
+          if (!out.startsWith('{')) {
+            // Bare token (historical contract). Real tokens never start with '{'.
+            done(out);
+            return;
+          }
+          // macOS Claude Code stores the FULL credentials JSON as the item password
+          // (issue #2). A '{'-prefixed string is never a bearer token: extract the
+          // access token, or return null so the file fallback gets its chance.
+          // The parse AND the extract both live inside this try so the whole
+          // callback body is throw-proof — a throw escaping here would bypass
+          // main()'s fail-open net and crash the hook process.
+          let token = null;
+          try {
+            token = extractAccessToken(JSON.parse(out));
+          } catch {
+            // Corrupt blob — discard silently (the SyntaxError embeds input snippets).
+          }
+          done(token);
         },
       );
       // Belt-and-suspenders kill in case the impl ignores the timeout option.
@@ -736,8 +951,83 @@ export async function main(deps) {
     const input = parseHookInput(inputText);
     const eventName = input.hook_event_name;
 
-    // PreToolUse ScheduleWakeup exemption (so the model can sleep through reset).
+    // -------------------------------------------------------------------------
+    // SessionStart — one-time onboarding hint (never fetches, never exits 2).
+    // -------------------------------------------------------------------------
+    if (eventName === 'SessionStart') {
+      try {
+        if (!isConfigured(deps.env)) {
+          const markerPath = joinPath(claudeDir(deps.homedir), ONBOARD_BASENAME);
+          let onboarded = true;
+          try { await deps.fs.readFile(markerPath, 'utf8'); }
+          catch { onboarded = false; }
+          if (!onboarded) {
+            deps.stdout(buildOnboardingMessage(deps.platform) + '\n');
+            log('onboarding', {});
+            try { await deps.fs.writeFile(markerPath, 'v1\n', { mode: 0o600 }); }
+            catch { /* discard — benign repeat next session */ }
+          }
+        }
+      } catch { /* discard — fail-open */ }
+      deps.exit(0);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // PreToolUse ScheduleWakeup — upgraded exemption with resume-marker stamping.
+    // This branch MUST NEVER exit 2. Any deviation → plain exit 0.
+    // -------------------------------------------------------------------------
     if (eventName === 'PreToolUse' && input.tool_name === 'ScheduleWakeup') {
+      try {
+        // Determine block state from cache ONLY — no fetch on this path.
+        const cachedData = await readCache(deps);
+        if (cachedData) {
+          const wakeupWindows = parseWindows(cachedData, deps.now());
+          const { worst: wakeupWorst, level: wakeupLevel } = evaluateThresholds(wakeupWindows, cfg);
+          if (
+            wakeupLevel === 'hard' &&
+            wakeupWorst &&
+            isPlainObject(input.tool_input) &&
+            typeof input.tool_input.prompt === 'string'
+          ) {
+            const originalPrompt = input.tool_input.prompt;
+            // Never stamp sentinels or already-marked prompts.
+            if (
+              !originalPrompt.startsWith(RESUME_MARKER) &&
+              !AUTONOMOUS_SENTINELS.has(originalPrompt)
+            ) {
+              // Build updatedInput from allowlist only.
+              const updatedInput = {};
+              if (
+                typeof input.tool_input.delaySeconds === 'number' &&
+                Number.isFinite(input.tool_input.delaySeconds)
+              ) {
+                updatedInput.delaySeconds = input.tool_input.delaySeconds;
+              }
+              updatedInput.prompt = RESUME_MARKER + ' ' + originalPrompt;
+              if (typeof input.tool_input.reason === 'string') {
+                updatedInput.reason = input.tool_input.reason;
+              }
+              const jsonOutput = JSON.stringify({
+                hookSpecificOutput: {
+                  hookEventName: 'PreToolUse',
+                  permissionDecision: 'allow',
+                  permissionDecisionReason: 'usage-guard: tagged wakeup as quota resume hop',
+                  updatedInput,
+                },
+              });
+              deps.stdout(jsonOutput + '\n');
+              log('wakeup_marked', { label: wakeupWorst.label, util: wakeupWorst.util });
+            }
+          }
+        }
+      } catch {
+        // Any deviation → plain exit 0 with no output. The single JSON line is
+        // fully built before the one deps.stdout() call, so a throw either
+        // precedes the write (nothing is emitted) or follows it (a complete,
+        // valid line is already out). Either way we fall through to exit 0 and
+        // can never exit 2 — a blocked model must never be trapped here.
+      }
       deps.exit(0);
       return;
     }
@@ -757,7 +1047,8 @@ export async function main(deps) {
     if (eventName === 'PreToolUse') {
       if (level === 'hard' && worst) {
         log('blocked', { label: worst.label, util: worst.util });
-        deps.stderr(buildToolBlockMessage(worst, deps.now()) + '\n');
+        const isSubagent = typeof input.agent_id === 'string' && input.agent_id.length > 0;
+        deps.stderr(buildToolBlockMessage(worst, deps.now(), isSubagent) + '\n');
         deps.exit(2);
         return;
       }
@@ -767,8 +1058,31 @@ export async function main(deps) {
       return;
     }
 
+    // -------------------------------------------------------------------------
     // UserPromptSubmit (and any other / manual event).
+    // -------------------------------------------------------------------------
     if (level === 'hard' && worst) {
+      // Check if this is a resume hop.
+      if (isResumeHopPrompt(input)) {
+        // Resume hop: still blocked. Determine time-to-reset.
+        const msToReset = worst.reset.getTime() - deps.now().getTime();
+        const sixHoursMs = 6 * 60 * 60 * 1000;
+        log('resume_hop', { label: worst.label, util: worst.util });
+        if (msToReset <= sixHoursMs) {
+          // Within 6h: re-instruct reschedule.
+          const line = formatSummary(windows) + buildResumeHopSuffix(worst, deps.now());
+          deps.stdout(line + '\n');
+          deps.exit(0);
+          return;
+        } else {
+          // Beyond 6h: chain-termination, no reschedule.
+          const line = formatSummary(windows) + buildResumeTerminationSuffix(worst);
+          deps.stdout(line + '\n');
+          deps.exit(0);
+          return;
+        }
+      }
+      // Normal hard block (no marker).
       log('blocked', { label: worst.label, util: worst.util });
       deps.stderr(buildPromptBlockMessage(worst, cfg) + '\n');
       deps.exit(2);
@@ -790,6 +1104,13 @@ export async function main(deps) {
     } else {
       log('ok', {});
     }
+
+    // If this is a resume-hop prompt but the window has since reset (or util
+    // fell below hard), append the ready suffix so the model resumes the task.
+    if (isResumeHopPrompt(input)) {
+      line += buildResumeReadySuffix();
+    }
+
     deps.stdout(line + '\n');
     deps.exit(0);
   } catch {

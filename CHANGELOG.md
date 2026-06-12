@@ -4,6 +4,121 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-12
+
+### Added
+
+- **SessionStart one-time onboarding hint (issue #1).** The `/plugin install` config
+  instructions reach the model wrapped in a local-command-caveat, so the model does not
+  act on them. A `SessionStart` hook's stdout arrives as trusted (uncaveated) context —
+  the guard now uses it to post a one-time setup note when no `CLAUDE_USAGE_GUARD*` env
+  var is set and the onboarded marker (`~/.claude/usage-guard-onboarded`) is absent.
+
+  The hint explains the active defaults (WARN 80%, HARD 95%), shows the
+  `~/.claude/settings.json` env block to customize them, mentions optional vars
+  (`_TTL`, `_DEBUG`, `off`), and ends with an explicit instruction for the model to offer
+  to apply the block for the user — converting trusted context into a proactive offer.
+
+  Platform-aware: on macOS the note names the Keychain item (`Claude Code-credentials`,
+  macOS only) and reminds the user to choose "Always Allow" on the one-time Keychain
+  permission prompt. On all other platforms it refers only to `~/.claude/.credentials.json`.
+
+  Invariants: the `SessionStart` branch never reads credentials, never fetches, never
+  exits 2, and leaks nothing (output rebuilt from constants + a platform branch only).
+  A `CLAUDE_USAGE_GUARD=off` guard exits before the branch runs, so a disabled guard
+  never onboards. A failed marker write causes only a benign repeat at the next session
+  start (hint has already been emitted before the write attempt). Fail-open everywhere.
+
+  New artifacts: `~/.claude/usage-guard-onboarded` (onboarding marker, mode 0600).
+
+### Changed
+
+- Hook contract updated to v0.4.0 in the file header comment.
+- `DEBUG_EVENTS` allowlist extended with `'onboarding'`.
+
+### Tests
+
+- 22 new tests: T14.1–T14.8 (`test/t14-session-start.mjs`) covering the full
+  SessionStart surface, `isConfigured` unit tests, and `buildOnboardingMessage` shape
+  checks (platform-aware, timezone-safe — no ISO dates, no absolute weekdays), including
+  an explicit assertion that the credentials file is never read on the SessionStart path.
+  T4.13 added to `test/t4-token-leak.mjs` pinning the no-leak/no-fetch invariant on the
+  SessionStart path. (183 → 206 tests.)
+
+## [0.3.0] - 2026-06-12
+
+### Fixed
+
+- **Session does not resume after quota reset (issue #3).** When a `ScheduleWakeup`
+  fired during a hard-block, the harness re-entered its prompt verbatim as a
+  `UserPromptSubmit`. The guard's exit-2 block erased that wake turn before the model
+  ran — the resume chain died silently. Fixed via a two-part mechanism:
+
+  **Marker stamping (PreToolUse/ScheduleWakeup path):** When the guard is hard-blocked
+  and a `ScheduleWakeup` is dispatched with an unmarked prompt, the guard now emits a
+  single allowlisted JSON line on stdout (`hookSpecificOutput` / `updatedInput`) that
+  stamps `[usage-guard:resume]` onto the prompt. Sentinel prompts
+  (`<<autonomous-loop>>`, `<<autonomous-loop-dynamic>>`) and already-marked prompts are
+  left untouched. Any stamping error falls back to plain exit 0 — the branch can never
+  exit 2.
+
+  **Hop routing (UserPromptSubmit path):** A `UserPromptSubmit` whose prompt starts with
+  `[usage-guard:resume]` is recognized as a resume hop and allowed through (exit 0)
+  regardless of utilization. If still blocked and reset is ≤ 6h away, the guard appends
+  a hop-suffix instructing the model to reschedule with the same prompt. If reset is >
+  6h away, it instructs chain termination instead (no multi-day rescheduling). Once the
+  window has reset (dropped by `parseWindows`), the guard appends a resume-ready suffix
+  telling the model to resume the task. Sub-agent handling is threaded throughout: a
+  `PreToolUse` block message now detects sub-agents via `agent_id` and instructs them
+  to abort and return a resume brief to their caller (sub-agents cannot call
+  `ScheduleWakeup`).
+
+  The `[usage-guard:resume]` string is a **compatibility contract** — it must never
+  change across plugin versions.
+
+### Added
+
+- `RESUME_MARKER` constant exported from `usage-guard.mjs` (the marker string; must
+  never change).
+- `isResumeHopPrompt(input)` exported pure helper — returns true iff the input is a
+  `UserPromptSubmit` whose prompt starts with `RESUME_MARKER`.
+- `computeHopDelaySeconds(worst, now)` exported pure helper — computes a
+  `ScheduleWakeup` delay clamped to [60, 3600] with a 120s buffer past reset.
+- `buildResumeHopSuffix(worst, now)` exported builder — the still-blocked re-schedule
+  instruction appended to the hop stdout line.
+- `buildResumeReadySuffix()` exported builder — the window-has-reset instruction
+  appended when a resume-hop prompt arrives after reset.
+- `buildToolBlockMessage` now accepts a third `isSubagent` argument (detected via
+  `agent_id`) and emits a sub-agent-specific abort message.
+- `buildPromptBlockMessage` now notes that scheduled resume wakeups are exempt.
+- Debug events `resume_hop` and `wakeup_marked` added to `DEBUG_EVENTS` allowlist.
+- 28 new tests: T13.1–T13.9 (resume-hop `UserPromptSubmit` handling), T6.7–T6.13
+  (ScheduleWakeup marker-stamping paths), T4.12 (token-leak guard on new JSON-stdout
+  path). (155 → 183 tests.)
+
+### Changed
+
+- **PreToolUse hook contract amended:** the `ScheduleWakeup`-exempt branch may now emit
+  exactly one allowlisted JSON line on stdout (the `hookSpecificOutput` / `updatedInput`
+  stamp) when hard-blocked and the prompt is unmarked. All other `PreToolUse` paths
+  remain zero-stdout. The security posture comment and CLAUDE.md hook-contract paragraph
+  are updated accordingly.
+
+## [0.2.2] - 2026-06-12
+
+### Fixed
+
+- **macOS Keychain JSON-blob fix (issue #2).** macOS Claude Code stores the full
+  credentials JSON as the Keychain item password, causing `readTokenFromKeychain` to
+  forward the raw JSON blob as the Bearer token, producing a 401 for all macOS OAuth
+  users. The success branch now detects a `{`-prefixed string and extracts the access
+  token via a new private `extractAccessToken` helper (shared with `readTokenFromFile`).
+  Bare token strings (historical contract) are returned unchanged. Corrupt blobs fall
+  back to the credentials file; parseable-but-unusable shapes (missing or wrong-typed
+  `accessToken`) also fall back. Corrupt blob with no file present → fail-soft exit 0.
+  Six regression tests added (T5.10–T5.15) and one token-leak test under debug mode
+  (T4.11). (148 → 155 tests.)
+
 ## [0.2.1] - 2026-06-11
 
 Security-audit follow-up: hardening, correctness fixes, and one regression test per fix.

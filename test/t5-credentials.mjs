@@ -306,4 +306,195 @@ describe('T5 — Credentials', () => {
     assert.equal(fetchCalls.length, 1, 'SIGKILL fallback → fetch');
     assert.equal(exits[0], 0);
   });
+
+  // -------------------------------------------------------------------------
+  // T5.10 darwin: keychain returns full credentials JSON blob (issue #2)
+  // -------------------------------------------------------------------------
+  it('T5.10 darwin: keychain returns JSON blob → access token extracted, fetch uses correct token', async () => {
+    const { deps, fetchCalls, exits } = makeDeps({
+      env: ENV_ALWAYS_STALE,
+      stdin: async () => UPS,
+      platform: 'darwin',
+      initialFs: {}, // No creds file — keychain only.
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, makeCredsJson('keychain-blob-token') + '\n');
+        return { on() {} };
+      },
+      fetchImpl: async () => ({
+        status: 200,
+        async json() { return {}; },
+      }),
+    });
+
+    await main(deps);
+
+    assert.equal(fetchCalls.length, 1, 'should fetch exactly once');
+    assert.equal(
+      fetchCalls[0].options.headers.Authorization,
+      'Bearer keychain-blob-token',
+      'Authorization header must use the extracted access token (not the JSON blob)'
+    );
+    assert.equal(exits[0], 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T5.11 darwin: keychain blob wins over creds file (no file fallback on success)
+  // -------------------------------------------------------------------------
+  it('T5.11 darwin: keychain blob token used; creds file not read on success', async () => {
+    const { deps, fetchCalls, fakeFs, exits } = makeDeps({
+      env: ENV_ALWAYS_STALE,
+      stdin: async () => UPS,
+      platform: 'darwin',
+      initialFs: { [CREDS_PATH]: makeCredsJson('file-token-B') },
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, makeCredsJson('keychain-blob-token-A') + '\n');
+        return { on() {} };
+      },
+      fetchImpl: async () => ({
+        status: 200,
+        async json() { return {}; },
+      }),
+    });
+
+    await main(deps);
+
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(
+      fetchCalls[0].options.headers.Authorization,
+      'Bearer keychain-blob-token-A',
+      'should use keychain token A, not file token B'
+    );
+    // Creds file must NOT have been read (keychain succeeded).
+    const credsRead = fakeFs.reads.find((r) => r.path.includes('.credentials.json'));
+    assert.equal(credsRead, undefined, 'creds file must not be read when keychain succeeds');
+    assert.equal(exits[0], 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T5.12 darwin: keychain returns bare non-JSON token (legacy contract)
+  // -------------------------------------------------------------------------
+  it('T5.12 darwin: keychain returns bare non-JSON token → used as-is', async () => {
+    const { deps, fetchCalls, exits } = makeDeps({
+      env: ENV_ALWAYS_STALE,
+      stdin: async () => UPS,
+      platform: 'darwin',
+      initialFs: {},
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, 'bare-keychain-token\n');
+        return { on() {} };
+      },
+      fetchImpl: async () => ({
+        status: 200,
+        async json() { return {}; },
+      }),
+    });
+
+    await main(deps);
+
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(
+      fetchCalls[0].options.headers.Authorization,
+      'Bearer bare-keychain-token',
+      'bare token must be used verbatim (legacy contract)'
+    );
+    assert.equal(exits[0], 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T5.13 darwin: keychain returns corrupt {-prefixed JSON → falls back to file
+  // -------------------------------------------------------------------------
+  it('T5.13 darwin: keychain returns corrupt JSON blob → file fallback', async () => {
+    const { deps, fetchCalls, exits } = makeDeps({
+      env: ENV_ALWAYS_STALE,
+      stdin: async () => UPS,
+      platform: 'darwin',
+      initialFs: { [CREDS_PATH]: makeCredsJson('file-fallback-token') },
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, '{"claudeAiOauth": '); // truncated / corrupt JSON
+        return { on() {} };
+      },
+      fetchImpl: async () => ({
+        status: 200,
+        async json() { return {}; },
+      }),
+    });
+
+    await main(deps);
+
+    assert.equal(fetchCalls.length, 1, 'file fallback must produce a fetch');
+    assert.equal(
+      fetchCalls[0].options.headers.Authorization,
+      'Bearer file-fallback-token',
+      'must fall back to file token when keychain blob is corrupt'
+    );
+    assert.equal(exits[0], 0);
+  });
+
+  // -------------------------------------------------------------------------
+  // T5.14 darwin: parseable-but-unusable blob shapes → file fallback each time
+  // -------------------------------------------------------------------------
+  it('T5.14 darwin: parseable-but-unusable blob shapes → file fallback', async () => {
+    const unusableBlobs = [
+      '{}',
+      JSON.stringify({ claudeAiOauth: {} }),
+      JSON.stringify({ claudeAiOauth: { accessToken: '' } }),
+      JSON.stringify({ claudeAiOauth: { accessToken: 42 } }),
+    ];
+
+    for (const blob of unusableBlobs) {
+      const { deps, fetchCalls, exits } = makeDeps({
+        env: ENV_ALWAYS_STALE,
+        stdin: async () => UPS,
+        platform: 'darwin',
+        initialFs: { [CREDS_PATH]: makeCredsJson('file-token-for-unusable') },
+        now: () => new Date(FIXED_NOW_MS),
+        execFileImpl: (_cmd, _args, _opts, cb) => {
+          cb(null, blob);
+          return { on() {} };
+        },
+        fetchImpl: async () => ({
+          status: 200,
+          async json() { return {}; },
+        }),
+      });
+
+      await main(deps);
+
+      assert.equal(fetchCalls.length, 1, `blob "${blob.slice(0, 40)}" should fall back to file`);
+      assert.equal(
+        fetchCalls[0].options.headers.Authorization,
+        'Bearer file-token-for-unusable',
+        `blob "${blob.slice(0, 40)}" must not supply a token`
+      );
+      assert.equal(exits[0], 0);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // T5.15 darwin: corrupt blob + no creds file → fail-soft (no fetch, exit 0)
+  // -------------------------------------------------------------------------
+  it('T5.15 darwin: corrupt JSON blob + no creds file → fail-soft exit 0, no fetch', async () => {
+    const { deps, stdout, stderr, fetchCalls, exits } = makeDeps({
+      env: ENV_ALWAYS_STALE,
+      stdin: async () => UPS,
+      platform: 'darwin',
+      initialFs: {}, // No creds file.
+      now: () => new Date(FIXED_NOW_MS),
+      execFileImpl: (_cmd, _args, _opts, cb) => {
+        cb(null, '{"claudeAiOauth": '); // corrupt blob
+        return { on() {} };
+      },
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 0, 'corrupt blob + no file → fail-soft exit 0');
+    assert.equal(stdout.length, 0, 'no stdout on fail-soft');
+    assert.equal(stderr.length, 0, 'no stderr on fail-soft');
+    assert.equal(fetchCalls.length, 0, 'no fetch when creds cannot be resolved');
+  });
 });
