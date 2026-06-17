@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-17
+
+### Fixed
+
+- **Account switch no longer keeps blocking after a login change (auto-heal).** When
+  account A was exhausted and the user switched to account B, account A's stale 100%
+  windows could keep blocking indefinitely: on every failed usage fetch the
+  negative-cache marker resurrected the previous fetch's windows (and kept its old
+  `fetchedAt`), so if account B's usage fetch ever failed (e.g. a business/Team token
+  rejected on the personal OAuth usage endpoint), the loop never cleared.
+
+  A failed fetch now writes a marker with **no windows** (`windows: {}`) and
+  `fetchedAt: null`, so a stale exhausted account can never block a freshly-switched
+  account. The marker still suppresses re-fetching for the negative-cache window via
+  `failedAt`; it simply blocks nothing. This is the fail-open-consistent choice: a
+  transient outage on a genuinely-exhausted *same* account briefly allows prompts
+  (bounded by the negative-cache window) rather than trapping the user — and the
+  `[usage]` summary is omitted only during such a transient failure.
+
+### Added
+
+- **`usage-guard recheck` command — force a fresh check against the current login.**
+  Sending the prompt `usage-guard recheck` (also `[usage-guard:recheck]` or
+  `usage guard recheck`, case-insensitive) forces a fetch that bypasses **all** cache
+  (positive and negative) and applies the honest block decision to the fresh result:
+
+  - current login under the limit → unblocked, prints the fresh `[usage]` line;
+  - current login genuinely over the limit → still blocked (exit 2) — the command does
+    no real work, so it cannot smuggle a task past the gate (exact-match only; any
+    trailing text makes it a normal prompt);
+  - current login unreadable (fetch fails / no credentials) → fail-open with an
+    explanatory message, never resurrecting a previous account's data.
+
+  The hard-block message and the SessionStart onboarding hint now advertise the command
+  and when to use it (switched accounts, or a block believed to be wrong). Mirrors the
+  existing `[usage-guard:resume]` magic-prefix precedent — the prompt box is the only
+  surface a blocked user can reach.
+
+  Invariants preserved: the OAuth token is still unwrapped at exactly one line; no
+  `USAGE_URL` env override; all output is rebuilt from validated numbers; recheck is
+  gated to `UserPromptSubmit` only (never `PreToolUse`/`ScheduleWakeup`) and every
+  unexpected error still exits 0.
+
 ## [0.4.0] - 2026-06-12
 
 ### Added
