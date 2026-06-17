@@ -30,6 +30,18 @@
 //    exit 2 + stderr = block. The [usage-guard:resume] prefix identifies a
 //    scheduled resume wakeup; the guard lets these through the prompt gate,
 //    re-instructs reschedule-or-resume each hop.
+//    A prompt of exactly `usage-guard recheck` (the RECHECK_COMMAND, also the
+//    bracket form [usage-guard:recheck]) forces a fresh fetch that bypasses ALL
+//    cache (positive + negative), then applies the normal block decision to the
+//    fresh result — so it can clear a stale cross-account block but cannot let
+//    work through on a genuinely over-limit account.
+//
+// AUTO-HEAL (v0.5.0): a failed fetch NO LONGER carries the previous fetch's
+// windows into the negative-cache marker (windows := {}). Resurrecting stale
+// windows across a credential/account switch let an exhausted account A keep
+// blocking a fresh account B indefinitely (each failed B fetch re-preserved
+// A's windows). Dropping them on failure is the fail-open-consistent choice;
+// the manual `usage-guard recheck` is the fast-path recovery.
 //  - PreToolUse: exit 0 = allow; exit 2 + stderr = block. NEVER exit 2 on the
 //    ScheduleWakeup path (so the model can never be trapped). The ScheduleWakeup
 //    path may stamp the RESUME_MARKER onto an unmarked wakeup prompt (one JSON
@@ -97,6 +109,8 @@ const DEBUG_EVENTS = new Set([
   'resume_hop',
   'wakeup_marked',
   'onboarding',
+  'recheck',
+  'recheck_blocked',
 ]);
 
 const REDACTED = '[redacted]';
@@ -114,6 +128,14 @@ const REDACTED = '[redacted]';
  * compatibility contract across plugin versions.
  */
 export const RESUME_MARKER = '[usage-guard:resume]';
+
+/**
+ * User-typed command that forces a fresh usage check, bypassing all cache
+ * (positive AND negative). Intended for when the user has switched accounts or
+ * believes a block is a mistake. The bracket form mirrors RESUME_MARKER.
+ */
+export const RECHECK_COMMAND = 'usage-guard recheck';
+const RECHECK_BRACKET = '[usage-guard:recheck]';
 
 /**
  * Sentinel strings used by the Claude Code harness for autonomous loop
@@ -361,6 +383,19 @@ export function formatSummary(windows) {
   return `[usage] ${parts.join(' | ')}`;
 }
 
+/**
+ * Base [usage] line shared by the plain, recheck-cleared, and resume-ready
+ * UserPromptSubmit branches: the summary plus the WARN wind-down suffix when at
+ * warn level. Each caller appends its own branch-specific suffix. Keeping this
+ * one place avoids the summary+warn assembly drifting across the three sites.
+ * (buildWarnSuffix is a hoisted function declaration defined below.)
+ */
+function buildUsageLine(windows, level, worst) {
+  let line = formatSummary(windows);
+  if (level === 'warn' && worst) line += buildWarnSuffix(worst);
+  return line;
+}
+
 // ---------------------------------------------------------------------------
 // Resume-hop helpers
 // ---------------------------------------------------------------------------
@@ -375,6 +410,25 @@ export function isResumeHopPrompt(input) {
     input.hook_event_name === 'UserPromptSubmit' &&
     typeof input.prompt === 'string' &&
     input.prompt.startsWith(RESUME_MARKER)
+  );
+}
+
+/**
+ * Returns true iff the input is a UserPromptSubmit whose prompt is exactly the
+ * recheck command (the whole prompt, after trim/lowercase/whitespace-collapse).
+ * Forgiving on spacing and hyphen-vs-space, but EXACT-match only — trailing
+ * task text makes it a normal prompt (so it cannot smuggle work past the gate).
+ * Accepted forms: `usage-guard recheck`, `usage guard recheck`,
+ * `[usage-guard:recheck]` (any case).
+ */
+export function isRecheckPrompt(input) {
+  if (input.hook_event_name !== 'UserPromptSubmit') return false;
+  if (typeof input.prompt !== 'string') return false;
+  const p = input.prompt.trim().toLowerCase().replace(/\s+/g, ' ');
+  return (
+    p === RECHECK_COMMAND ||
+    p === 'usage guard recheck' ||
+    p === RECHECK_BRACKET
   );
 }
 
@@ -402,8 +456,49 @@ export function buildPromptBlockMessage(worst, cfg) {
   return (
     `QUOTA GUARD: ${worst.label} window at ${worst.util}% (limit ${cfg.hard}%). ` +
     `Prompts blocked until reset at ${fmtWeekdayDateTime(worst.reset)} local. ` +
-    `Bypass: set CLAUDE_USAGE_GUARD=off. ` +
+    `Switched accounts, or think this block is wrong (stale data, wrong login)? ` +
+    `Send the prompt "${RECHECK_COMMAND}" to force a fresh check against your CURRENT login — ` +
+    `it ignores all cached data and re-reads your real usage. ` +
+    `Bypass entirely: set CLAUDE_USAGE_GUARD=off. ` +
     `Scheduled resume wakeups (prefixed ${RESUME_MARKER}) are exempt and will still fire.`
+  );
+}
+
+/**
+ * UserPromptSubmit HARD block message after a recheck (stderr). A still-hard
+ * result means the CURRENT login is genuinely over the limit (a failed fetch
+ * yields no windows and never reaches this path), so the fresh check confirms
+ * the block rather than clearing it.
+ */
+export function buildRecheckBlockMessage(worst, cfg) {
+  return (
+    `QUOTA GUARD (rechecked): ${worst.label} window at ${worst.util}% (limit ${cfg.hard}%) ` +
+    `on your current login. Fresh check confirms the block is real — resets at ` +
+    `${fmtWeekdayDateTime(worst.reset)} local. ` +
+    `If you switched accounts, the new account is also over its limit. ` +
+    `Bypass: set CLAUDE_USAGE_GUARD=off.`
+  );
+}
+
+/**
+ * Suffix appended to the [usage] summary when a recheck clears the block
+ * (current login is under the hard limit). Stdout, exit 0.
+ */
+export function buildRecheckClearedSuffix() {
+  return ` -- RECHECK: current login is under the hard limit. Unblocked.`;
+}
+
+/**
+ * Stdout line when a recheck could not read any usage for the current login
+ * (fetch failed / no usable windows). The guard cannot measure this account,
+ * so it fails open (exit 0). Built from constants only.
+ */
+export function buildRecheckUnreadableMessage() {
+  return (
+    `[usage-guard] Recheck: could not read usage for your current login ` +
+    `(no usage data returned). The guard cannot measure this account, so prompts ` +
+    `are allowed (fail-open). If you expected this account to be measured, confirm ` +
+    `you are logged into the right account and that it has subscription usage.`
   );
 }
 
@@ -536,6 +631,8 @@ export function buildOnboardingMessage(platform) {
     `  }\n` +
     `Optional: CLAUDE_USAGE_GUARD_TTL (cache seconds), CLAUDE_USAGE_GUARD_DEBUG=1 (diagnostics), ` +
     `CLAUDE_USAGE_GUARD=off (disable). Env reloads at next session start.\n` +
+    `If you ever get blocked right after switching accounts (or think a block is wrong), ` +
+    `send the prompt "${RECHECK_COMMAND}" to force a fresh check against your current login.\n` +
     `${credLine}\n` +
     `If the user wants different thresholds, offer to add the env block above to their settings.json.`
   );
@@ -824,23 +921,29 @@ function serializeUsageResponse(body, now) {
  * debug logger can refuse to emit any line containing it. The token is never
  * used for output anywhere in this function.
  */
-async function acquireData(deps, cfg, log, setProbe) {
+async function acquireData(deps, cfg, log, setProbe, opts = {}) {
   const now = deps.now().getTime();
+  const forceRefresh = opts.forceRefresh === true;
   const cached = await readCache(deps);
 
-  // Fresh positive cache.
-  if (cached && cached.fetchedAt !== null && now - cached.fetchedAt < cfg.ttlMs) {
-    log('cache_hit', {});
-    return cached;
+  // forceRefresh (manual `usage-guard recheck`) bypasses BOTH caches: the
+  // user is explicitly asking us to re-measure their current login.
+  if (!forceRefresh) {
+    // Fresh positive cache.
+    if (cached && cached.fetchedAt !== null && now - cached.fetchedAt < cfg.ttlMs) {
+      log('cache_hit', {});
+      return cached;
+    }
+
+    // Negative cache: recent failure => don't hit network (fail-soft).
+    if (cached && cached.failedAt !== null && now - cached.failedAt < NEGATIVE_CACHE_MS) {
+      log('negative_cache', {});
+      return cached;
+    }
   }
 
-  // Negative cache: recent failure => don't hit network (fail-soft).
-  if (cached && cached.failedAt !== null && now - cached.failedAt < NEGATIVE_CACHE_MS) {
-    log('negative_cache', {});
-    return cached;
-  }
-
-  if (cached) log('cache_stale', {});
+  if (forceRefresh) log('recheck', {});
+  else if (cached) log('cache_stale', {});
   else log('cache_miss', {});
 
   // Acquire credentials (platform-aware).
@@ -853,7 +956,10 @@ async function acquireData(deps, cfg, log, setProbe) {
   }
   if (!raw) {
     log('creds_missing', {});
-    return cached; // fail-soft: whatever stale cache we had (maybe null)
+    // On a manual recheck the user explicitly distrusts the cache, so stale
+    // windows must not be resurrected when creds are unreadable — return null
+    // (fail open) rather than the old account's data.
+    return forceRefresh ? null : cached; // fail-soft: stale cache (maybe null)
   }
   setProbe(raw); // expose to logger guard only; never used for output
   const tokenHolder = makeTokenHolder(raw);
@@ -864,12 +970,17 @@ async function acquireData(deps, cfg, log, setProbe) {
     return fetched;
   }
 
-  // Fetch failed => write a negative-cache marker (preserving stale windows).
+  // Fetch failed => write a negative-cache marker. AUTO-HEAL: do NOT carry the
+  // previous fetch's windows forward. Resurrecting them let an exhausted prior
+  // account keep blocking a freshly-switched account indefinitely (each failed
+  // fetch re-preserved the stale windows). fetchedAt is also cleared so the
+  // marker never looks "fresh". The marker still suppresses re-fetching for
+  // NEGATIVE_CACHE_MS via failedAt; it simply blocks nothing.
   const failNowMs = deps.now().getTime();
   const marker = {
-    fetchedAt: cached && cached.fetchedAt !== null ? cached.fetchedAt : null,
+    fetchedAt: null,
     failedAt: failNowMs,
-    windows: cached && cached.windows ? cached.windows : {},
+    windows: {},
   };
   const cleanMarker = validateCache(marker, failNowMs);
   if (cleanMarker) await writeCache(deps, cleanMarker, log);
@@ -1032,12 +1143,22 @@ export async function main(deps) {
       return;
     }
 
+    // A manual `usage-guard recheck` prompt forces a fresh fetch that bypasses
+    // all cache (positive + negative) — see acquireData forceRefresh.
+    const recheck = isRecheckPrompt(input);
+
     // acquireData exposes the live raw token to the logger probe (for the
     // defense-in-depth line refusal) the instant it is read. The token is
     // never placed into output anywhere.
-    const data = await acquireData(deps, cfg, log, (raw) => {
-      liveTokenProbe = raw;
-    });
+    const data = await acquireData(
+      deps,
+      cfg,
+      log,
+      (raw) => {
+        liveTokenProbe = raw;
+      },
+      { forceRefresh: recheck },
+    );
 
     // Pass `now` so windows whose reset already passed are dropped — stale
     // data must never block past the actual reset.
@@ -1061,6 +1182,30 @@ export async function main(deps) {
     // -------------------------------------------------------------------------
     // UserPromptSubmit (and any other / manual event).
     // -------------------------------------------------------------------------
+
+    // Manual recheck: report the FRESH result honestly. A still-hard result
+    // confirms the current login is genuinely over the limit (blocks); anything
+    // else clears the block. The recheck command does no real work, so this
+    // cannot smuggle a task past the gate.
+    if (recheck) {
+      if (level === 'hard' && worst) {
+        log('recheck_blocked', { label: worst.label, util: worst.util });
+        deps.stderr(buildRecheckBlockMessage(worst, cfg) + '\n');
+        deps.exit(2);
+        return;
+      }
+      if (windows.length === 0) {
+        deps.stdout(buildRecheckUnreadableMessage() + '\n');
+        log('ok', {});
+        deps.exit(0);
+        return;
+      }
+      log(level === 'warn' ? 'warn' : 'ok', {});
+      deps.stdout(buildUsageLine(windows, level, worst) + buildRecheckClearedSuffix() + '\n');
+      deps.exit(0);
+      return;
+    }
+
     if (level === 'hard' && worst) {
       // Check if this is a resume hop.
       if (isResumeHopPrompt(input)) {
@@ -1097,13 +1242,8 @@ export async function main(deps) {
       return;
     }
 
-    let line = formatSummary(windows);
-    if (level === 'warn' && worst) {
-      line += buildWarnSuffix(worst);
-      log('warn', {});
-    } else {
-      log('ok', {});
-    }
+    log(level === 'warn' ? 'warn' : 'ok', {});
+    let line = buildUsageLine(windows, level, worst);
 
     // If this is a resume-hop prompt but the window has since reset (or util
     // fell below hard), append the ready suffix so the model resumes the task.
