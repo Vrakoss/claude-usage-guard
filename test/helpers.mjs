@@ -209,6 +209,7 @@ export const CLAUDE_DIR = `${HOME}/.claude`;
 export const CACHE_PATH = `${CLAUDE_DIR}/usage-guard-cache.json`;
 export const DEBUG_LOG_PATH = `${CLAUDE_DIR}/usage-guard-debug.log`;
 export const CREDS_PATH = `${CLAUDE_DIR}/.credentials.json`;
+export const PAUSE_PATH = `${CLAUDE_DIR}/usage-guard-pause.json`;
 
 // A reset time safely in the future (3 hours from FIXED_NOW_MS).
 export const RESET_IN_3H = new Date(FIXED_NOW_MS + 3 * 60 * 60 * 1000).toISOString();

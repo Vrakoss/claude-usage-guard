@@ -115,13 +115,22 @@ it will add the env block to your `~/.claude/settings.json`.
 ## Configuration
 
 All configuration is via environment variables. Invalid / non-numeric values fall back to
-the default; percentages are clamped to `1..100`; if `WARN ≥ HARD` both reset to defaults.
+the default; percentages are clamped to `1..100`; if `WARN ≥ HARD` both reset to defaults
+(the weekly pair is validated and reset independently of the base pair).
+
+The **5h** window uses the base `WARN`/`HARD`; the **weekly** windows (`7d`, `7d-opus`,
+`7d-sonnet`) use the separate `WEEKLY_WARN`/`WEEKLY_HARD`, which default higher so a slowly
+filling weekly window doesn't wind the agent down at the same low bar as the volatile 5h
+window. Each window is scored against its own thresholds and the **most severe** one drives
+the warn/block decision.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `CLAUDE_USAGE_GUARD` | *(unset)* | Set to `off` to disable the guard entirely (immediate exit 0, no output). The advertised bypass. |
-| `CLAUDE_USAGE_GUARD_WARN` | `80` | Utilization % at which the WIND DOWN advisory appears. |
-| `CLAUDE_USAGE_GUARD_HARD` | `95` | Utilization % at which prompts/tools are blocked. |
+| `CLAUDE_USAGE_GUARD_WARN` | `80` | 5h-window utilization % at which the WIND DOWN advisory appears. |
+| `CLAUDE_USAGE_GUARD_HARD` | `95` | 5h-window utilization % at which prompts/tools are blocked. |
+| `CLAUDE_USAGE_GUARD_WEEKLY_WARN` | `90` | Weekly-window (`7d*`) utilization % at which the WIND DOWN advisory appears. |
+| `CLAUDE_USAGE_GUARD_WEEKLY_HARD` | `95` | Weekly-window (`7d*`) utilization % at which prompts/tools are blocked. |
 | `CLAUDE_USAGE_GUARD_TTL` | `60` | Seconds to trust the cached usage snapshot before re-fetching. |
 | `CLAUDE_USAGE_GUARD_DEBUG` | *(unset)* | Set to `1` to append allowlisted JSON-lines diagnostics to `~/.claude/usage-guard-debug.log`. |
 
@@ -137,7 +146,9 @@ Claude Code `settings.json`:
 {
   "env": {
     "CLAUDE_USAGE_GUARD_WARN": "80",
-    "CLAUDE_USAGE_GUARD_HARD": "95"
+    "CLAUDE_USAGE_GUARD_HARD": "95",
+    "CLAUDE_USAGE_GUARD_WEEKLY_WARN": "90",
+    "CLAUDE_USAGE_GUARD_WEEKLY_HARD": "95"
   }
 }
 ```

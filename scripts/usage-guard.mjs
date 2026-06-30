@@ -48,6 +48,32 @@
 //    line stdout) when hard-blocked, to ensure the wake turn is recognized as
 //    a resume hop and handled correctly by the UserPromptSubmit branch.
 //
+// PAUSE LATCH (v0.6.0): a degenerate re-hop loop was reported (issue #5) — while
+// hard-blocked, Claude Code's /goal feature (a prompt-based Stop hook) re-drives
+// the agent every turn; each re-drive the agent re-scheduled a wakeup and
+// sometimes ran a shell probe, stacking dozens of wakeups and BURNING the very
+// quota the guard exists to conserve. A hook CANNOT make the agent idle (a Stop
+// hook cannot veto /goal's forced continuation — "any block wins"), so the guard
+// instead minimizes the cost of each forced re-drive. A small state file
+// `usage-guard-pause.json` (numbers only: { resetAtMs, nextWakeupAtMs }, strict
+// allowlist via validatePauseState, atomic 0o600 write, fully fail-open) records
+// that a wakeup is already pending. It is WRITTEN authoritatively on the
+// ScheduleWakeup PreToolUse path (the one place we KNOW a wakeup was scheduled),
+// and READ on the two non-resume hard-block paths to emit a WAIT instruction
+// ("a wakeup is already pending — do NOT schedule another, do NOT probe, end the
+// turn") instead of inviting yet another schedule. The RESUME_MARKER path is
+// carved OUT of the latch: a fired resume hop is PROOF the wakeup fired, so it
+// always re-evaluates fresh and never WAITs (else a buffer-early wakeup would be
+// strangled and the chain would die). Fail-open is ASYMMETRIC: any doubt (torn
+// read, validation failure, poisoned far-future timestamp) → SCHEDULE, never
+// WAIT, so a corrupt/poisoned pause file can never silently disable blocking.
+//
+// WEEKLY THRESHOLDS (v0.6.0): the 7d* windows take their own WARN/HARD
+// (CLAUDE_USAGE_GUARD_WEEKLY_WARN / _WEEKLY_HARD, defaults 90/95) so a slowly
+// filling weekly window does not wind the agent down at the same low bar as the
+// volatile 5h window. evaluateThresholds now scores each window against ITS
+// window-class thresholds and reports the most severe.
+//
 // TESTABILITY: all I/O is injected through `main(deps)`. Pure helpers are
 // exported. Importing this module performs no I/O and exits nothing.
 
@@ -73,12 +99,32 @@ const NEGATIVE_CACHE_MS = 300_000; // 5 min fail-soft backoff
 
 const DEFAULT_WARN = 80;
 const DEFAULT_HARD = 95;
+// Weekly (7d*) windows get their own, more lenient defaults so a slowly filling
+// weekly window does not wind the agent down at the same bar as the 5h window.
+const DEFAULT_WEEKLY_WARN = 90;
+const DEFAULT_WEEKLY_HARD = 95;
 const DEFAULT_TTL_S = 60;
+
+// Resume-hop chaining only makes sense within this horizon; beyond it the chain
+// terminates instead of sleeping for days. Shared by the block message, the
+// resume-hop branch, and the pause-state validator.
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+// Pause-latch tuning (v0.6.0, issue #5).
+//  - SKEW: the largest amount a scheduled wakeup may legitimately land past its
+//    own reset (must exceed computeHopDelaySeconds's +120s buffer). A pause
+//    record whose nextWakeupAtMs is further past resetAtMs than this is treated
+//    as poisoned and dropped.
+//  - GRACE: how long past the latched reset a pause record stays trusted before
+//    it is treated as stale (expired) on read.
+const PAUSE_WAKEUP_SKEW_MS = 180_000; // 3 min
+const PAUSE_GRACE_MS = 15 * 60_000; // 15 min
 
 const CACHE_BASENAME = 'usage-guard-cache.json';
 const DEBUG_BASENAME = 'usage-guard-debug.log';
 const CREDS_BASENAME = '.credentials.json';
 const ONBOARD_BASENAME = 'usage-guard-onboarded';
+const PAUSE_BASENAME = 'usage-guard-pause.json';
 
 // Window keys we understand, mapped to display labels.
 const WINDOW_LABELS = {
@@ -111,6 +157,10 @@ const DEBUG_EVENTS = new Set([
   'onboarding',
   'recheck',
   'recheck_blocked',
+  'pause_scheduled',
+  'pause_wait',
+  'pause_cleared',
+  'pause_write_failed',
 ]);
 
 const REDACTED = '[redacted]';
@@ -205,10 +255,28 @@ export function readConfig(env) {
     hard = DEFAULT_HARD;
   }
 
+  // Weekly (7d*) thresholds are independent of the 5h thresholds. Same
+  // validation discipline: invalid/NaN => default, clamp 1..100, and if
+  // weeklyWarn >= weeklyHard the pair is reset to its own defaults.
+  let weeklyWarn = clamp(
+    readIntEnv(env, 'CLAUDE_USAGE_GUARD_WEEKLY_WARN', DEFAULT_WEEKLY_WARN),
+    1,
+    100,
+  );
+  let weeklyHard = clamp(
+    readIntEnv(env, 'CLAUDE_USAGE_GUARD_WEEKLY_HARD', DEFAULT_WEEKLY_HARD),
+    1,
+    100,
+  );
+  if (weeklyWarn >= weeklyHard) {
+    weeklyWarn = DEFAULT_WEEKLY_WARN;
+    weeklyHard = DEFAULT_WEEKLY_HARD;
+  }
+
   let ttl = readIntEnv(env, 'CLAUDE_USAGE_GUARD_TTL', DEFAULT_TTL_S);
   if (!Number.isFinite(ttl) || ttl < 0) ttl = DEFAULT_TTL_S;
 
-  return { off, debug, warn, hard, ttlMs: ttl * 1000 };
+  return { off, debug, warn, hard, weeklyWarn, weeklyHard, ttlMs: ttl * 1000 };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +352,60 @@ export function validateCache(raw, nowMs) {
   return { fetchedAt, failedAt, windows: cleanWindows };
 }
 
+/**
+ * Strict allowlist validator for the pause-state file (v0.6.0, issue #5).
+ * The file holds ONLY two numbers — { resetAtMs, nextWakeupAtMs } — and never
+ * any token or user data. ANY deviation => null (treated as "no pause"), which
+ * degrades to the pre-v0.6.0 always-reschedule behavior (fail-open).
+ *
+ * When `nowMs` is provided the record is distrusted in three ways, each closing
+ * a way a stale or poisoned file could misbehave:
+ *   - resetAtMs already in the past  => stale (window reset) => null.
+ *   - resetAtMs implausibly far in the future (beyond the 6h resume horizon
+ *     plus grace) => poisoned attempt to pin the guard into permanent WAIT
+ *     (which would silently disable blocking) => null.
+ *   - nextWakeupAtMs landing further past resetAtMs than the hop buffer could
+ *     ever produce => implausible => null.
+ * The polarity is deliberately opposite to validateCache (which distrusts a
+ * FUTURE fetchedAt): here a far-future resetAtMs is the poison.
+ *
+ * Returns a freshly-built clean object; `raw` is never trusted for output.
+ */
+export function validatePauseState(raw, nowMs) {
+  if (!isPlainObject(raw)) return null;
+  const { resetAtMs, nextWakeupAtMs } = raw;
+  if (typeof resetAtMs !== 'number' || !Number.isFinite(resetAtMs)) return null;
+  if (typeof nextWakeupAtMs !== 'number' || !Number.isFinite(nextWakeupAtMs)) return null;
+
+  if (typeof nowMs === 'number' && Number.isFinite(nowMs)) {
+    if (resetAtMs <= nowMs) return null; // stale: window already reset
+    if (resetAtMs > nowMs + SIX_HOURS_MS + PAUSE_GRACE_MS) return null; // poisoned far-future
+  }
+  if (nextWakeupAtMs > resetAtMs + PAUSE_WAKEUP_SKEW_MS) return null; // implausible wakeup
+
+  return { resetAtMs, nextWakeupAtMs };
+}
+
+/**
+ * Decide what to instruct an already-hard-blocked, non-resume-hop turn to do:
+ *   'wait'     — a wakeup is still pending in the future; do NOT schedule
+ *                another (this is what breaks the degenerate re-hop loop).
+ *   'schedule' — no pending wakeup (none recorded, or the recorded one has
+ *                already fired); instruct/allow a single wakeup.
+ * `pauseState` must already be validated (validatePauseState). Fail-open is
+ * asymmetric: a null/expired/poisoned state yields 'schedule', never 'wait'.
+ */
+export function decidePauseAction(pauseState, now) {
+  if (
+    pauseState &&
+    typeof pauseState.nextWakeupAtMs === 'number' &&
+    now.getTime() < pauseState.nextWakeupAtMs
+  ) {
+    return 'wait';
+  }
+  return 'schedule';
+}
+
 // ---------------------------------------------------------------------------
 // Window parsing
 // ---------------------------------------------------------------------------
@@ -320,21 +442,50 @@ export function parseWindows(data, now) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The WARN/HARD pair that applies to a given window label. Weekly (7d*) windows
+ * use the weekly thresholds; everything else (5h) uses the base thresholds.
+ */
+export function thresholdsForLabel(label, cfg) {
+  if (isWeeklyLabel(label)) {
+    return { warn: cfg.weeklyWarn, hard: cfg.weeklyHard };
+  }
+  return { warn: cfg.warn, hard: cfg.hard };
+}
+
+const SEVERITY = { ok: 0, warn: 1, hard: 2 };
+
+/** Level of a single window against its own window-class thresholds. */
+function windowLevel(w, cfg) {
+  const { warn, hard } = thresholdsForLabel(w.label, cfg);
+  if (w.util >= hard) return 'hard';
+  if (w.util >= warn) return 'warn';
+  return 'ok';
+}
+
+/**
  * Evaluate windows against config. Returns:
  *   { worst: window|null, level: 'ok'|'warn'|'hard' }
- * `worst` is the window with the highest utilization.
+ * Each window is scored against ITS window-class thresholds (5h vs weekly), and
+ * the most SEVERE window wins (hard > warn > ok), ties broken by utilization.
+ * Note: the most severe is not necessarily the highest-utilization window — a
+ * 5h at 85% (warn 80) outranks a 7d at 88% (weekly warn 90, still ok).
  */
 export function evaluateThresholds(windows, cfg) {
   if (!windows || windows.length === 0) {
     return { worst: null, level: 'ok' };
   }
   let worst = windows[0];
+  let level = windowLevel(worst, cfg);
   for (const w of windows) {
-    if (w.util > worst.util) worst = w;
+    const wl = windowLevel(w, cfg);
+    if (
+      SEVERITY[wl] > SEVERITY[level] ||
+      (SEVERITY[wl] === SEVERITY[level] && w.util > worst.util)
+    ) {
+      worst = w;
+      level = wl;
+    }
   }
-  let level = 'ok';
-  if (worst.util >= cfg.hard) level = 'hard';
-  else if (worst.util >= cfg.warn) level = 'warn';
   return { worst, level };
 }
 
@@ -453,8 +604,9 @@ export function computeHopDelaySeconds(worst, now) {
 
 /** UserPromptSubmit HARD block message (stderr). */
 export function buildPromptBlockMessage(worst, cfg) {
+  const { hard } = thresholdsForLabel(worst.label, cfg);
   return (
-    `QUOTA GUARD: ${worst.label} window at ${worst.util}% (limit ${cfg.hard}%). ` +
+    `QUOTA GUARD: ${worst.label} window at ${worst.util}% (limit ${hard}%). ` +
     `Prompts blocked until reset at ${fmtWeekdayDateTime(worst.reset)} local. ` +
     `Switched accounts, or think this block is wrong (stale data, wrong login)? ` +
     `Send the prompt "${RECHECK_COMMAND}" to force a fresh check against your CURRENT login — ` +
@@ -471,8 +623,9 @@ export function buildPromptBlockMessage(worst, cfg) {
  * the block rather than clearing it.
  */
 export function buildRecheckBlockMessage(worst, cfg) {
+  const { hard } = thresholdsForLabel(worst.label, cfg);
   return (
-    `QUOTA GUARD (rechecked): ${worst.label} window at ${worst.util}% (limit ${cfg.hard}%) ` +
+    `QUOTA GUARD (rechecked): ${worst.label} window at ${worst.util}% (limit ${hard}%) ` +
     `on your current login. Fresh check confirms the block is real — resets at ` +
     `${fmtWeekdayDateTime(worst.reset)} local. ` +
     `If you switched accounts, the new account is also over its limit. ` +
@@ -521,7 +674,6 @@ export function buildWarnSuffix(worst) {
  */
 export function buildToolBlockMessage(worst, now, isSubagent) {
   const msToReset = worst.reset.getTime() - now.getTime();
-  const sixHoursMs = 6 * 60 * 60 * 1000;
   if (isSubagent) {
     return (
       `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
@@ -531,7 +683,7 @@ export function buildToolBlockMessage(worst, now, isSubagent) {
       `(context, tool calls, arguments). Your caller will relaunch you after reset.`
     );
   }
-  if (msToReset <= sixHoursMs) {
+  if (msToReset <= SIX_HOURS_MS) {
     const delay = computeHopDelaySeconds(worst, now);
     return (
       `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
@@ -540,6 +692,10 @@ export function buildToolBlockMessage(worst, now, isSubagent) {
       `delaySeconds=${delay} and a prompt STARTING WITH ${RESUME_MARKER} followed by ` +
       `a one-line resume brief (task to resume; which sub-agents to relaunch with what context — ` +
       `sub-agents abort on block and need fresh launch). ` +
+      `Schedule it AT MOST ONCE: if you are re-driven (e.g. by a goal or autonomous loop) ` +
+      `and a wakeup is already pending, do NOT schedule another. ` +
+      `Do NOT run shell commands or any other tool to check usage or the reset — the reset ` +
+      `time is stated above and probing only burns more quota. ` +
       `The guard lets that wakeup back through each hop and tells you whether to ` +
       `reschedule or resume. Then end the turn. Do not retry other tools before reset.`
     );
@@ -560,9 +716,34 @@ export function buildResumeHopSuffix(worst, now) {
   const delay = computeHopDelaySeconds(worst, now);
   return (
     ` -- RESUME HOP: ${worst.label} still at ${worst.util}% (reset ${fmtReset(worst)}). ` +
-    `Still blocked. Your ONLY action: call ScheduleWakeup with delaySeconds=${delay} ` +
+    `Still blocked. Your ONLY action: call ScheduleWakeup ONCE with delaySeconds=${delay} ` +
     `and the SAME prompt (starting with ${RESUME_MARKER}), then end the turn. ` +
+    `Do NOT run shell or any other tool to check usage/reset — probing burns quota. ` +
+    `If a goal or autonomous loop re-drives you before that wakeup fires, it cannot make ` +
+    `progress until reset: just end the turn without scheduling again. ` +
     `All other tools are gated/denied.`
+  );
+}
+
+/**
+ * Block message (stderr) for an already-hard-blocked, non-resume turn when a
+ * wakeup is ALREADY pending (decidePauseAction => 'wait'). This is the latch
+ * that breaks the degenerate re-hop loop: instead of inviting yet another
+ * ScheduleWakeup, it tells the model to stand down. Built from validated
+ * numbers + constants only; `nextWakeupAtMs` has already passed validatePauseState.
+ */
+export function buildPauseWaitMessage(worst, nextWakeupAtMs) {
+  const wakeupAt = new Date(nextWakeupAtMs);
+  const whenSuffix = Number.isNaN(wakeupAt.getTime())
+    ? ''
+    : ` (~${fmtWeekdayDateTime(wakeupAt)} local)`;
+  return (
+    `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
+    `A wakeup is ALREADY scheduled${whenSuffix} and will resume you after reset. ` +
+    `Do NOT schedule another wakeup, and do NOT run shell commands or any other tool to ` +
+    `check usage or the reset — probing only burns more quota. ` +
+    `If a goal or autonomous loop is re-driving you, it cannot make progress until reset: ` +
+    `STOP now and end the turn. The pending wakeup is the only thing that should run next.`
   );
 }
 
@@ -629,7 +810,9 @@ export function buildOnboardingMessage(platform) {
     `    "CLAUDE_USAGE_GUARD_WARN": "${DEFAULT_WARN}",\n` +
     `    "CLAUDE_USAGE_GUARD_HARD": "${DEFAULT_HARD}"\n` +
     `  }\n` +
-    `Optional: CLAUDE_USAGE_GUARD_TTL (cache seconds), CLAUDE_USAGE_GUARD_DEBUG=1 (diagnostics), ` +
+    `Optional: CLAUDE_USAGE_GUARD_WEEKLY_WARN / _WEEKLY_HARD (separate thresholds for the 7d* ` +
+    `windows, defaults ${DEFAULT_WEEKLY_WARN}/${DEFAULT_WEEKLY_HARD}), ` +
+    `CLAUDE_USAGE_GUARD_TTL (cache seconds), CLAUDE_USAGE_GUARD_DEBUG=1 (diagnostics), ` +
     `CLAUDE_USAGE_GUARD=off (disable). Env reloads at next session start.\n` +
     `If you ever get blocked right after switching accounts (or think a block is wrong), ` +
     `send the prompt "${RECHECK_COMMAND}" to force a fresh check against your current login.\n` +
@@ -846,6 +1029,74 @@ async function writeCache(deps, clean, log) {
         // discard
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pause-state read / write / clear (v0.6.0, issue #5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read + validate the pause-state file. Returns a clean { resetAtMs,
+ * nextWakeupAtMs } object or null on any problem (missing, unparseable, invalid,
+ * stale, poisoned). Throw-proof — mirrors readCache.
+ */
+async function readPauseState(deps) {
+  try {
+    const pausePath = joinPath(claudeDir(deps.homedir), PAUSE_BASENAME);
+    const text = await deps.fs.readFile(pausePath, 'utf8');
+    const parsed = JSON.parse(text);
+    return validatePauseState(parsed, deps.now().getTime());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Allowlist-serialize then atomic-write (temp + rename) the pause state at mode
+ * 0o600. `clean` must already be a validatePauseState result. Throw-proof —
+ * mirrors writeCache, including the Windows EPERM tmp-cleanup.
+ */
+async function writePauseState(deps, clean, log) {
+  let tmpPath = null;
+  try {
+    const dir = claudeDir(deps.homedir);
+    const pausePath = joinPath(dir, PAUSE_BASENAME);
+    const pid = typeof deps.pid === 'number' ? deps.pid : 0;
+    tmpPath = joinPath(dir, `${PAUSE_BASENAME}.${pid}.${deps.now().getTime()}.tmp`);
+    // Serialize only the two validated numbers — never `raw`.
+    const payload = JSON.stringify({
+      resetAtMs: clean.resetAtMs,
+      nextWakeupAtMs: clean.nextWakeupAtMs,
+    });
+    await deps.fs.writeFile(tmpPath, payload, { mode: 0o600 });
+    await deps.fs.rename(tmpPath, pausePath);
+    log('pause_scheduled', { nextWakeupAtMs: clean.nextWakeupAtMs });
+  } catch {
+    log('pause_write_failed', {});
+    if (tmpPath !== null && typeof deps.fs.unlink === 'function') {
+      try {
+        await deps.fs.unlink(tmpPath);
+      } catch {
+        // discard
+      }
+    }
+  }
+}
+
+/**
+ * Remove the pause-state file. Called on the transitions OUT of a pause
+ * (resume-ready, chain termination, recheck-cleared). Throw-proof; a missing
+ * file (ENOENT) is a no-op.
+ */
+async function clearPauseState(deps, log) {
+  try {
+    if (typeof deps.fs.unlink !== 'function') return;
+    const pausePath = joinPath(claudeDir(deps.homedir), PAUSE_BASENAME);
+    await deps.fs.unlink(pausePath);
+    log('pause_cleared', {});
+  } catch {
+    // discard — missing file or unlink failure is benign (validator expires it).
   }
 }
 
@@ -1095,6 +1346,18 @@ export async function main(deps) {
         if (cachedData) {
           const wakeupWindows = parseWindows(cachedData, deps.now());
           const { worst: wakeupWorst, level: wakeupLevel } = evaluateThresholds(wakeupWindows, cfg);
+          // The delay we both tell the harness (updatedInput.delaySeconds) AND
+          // record in the latch — one identical value, clamped to the harness's
+          // [60,3600] ScheduleWakeup limits, so the recorded nextWakeupAtMs always
+          // matches the wakeup the harness will actually fire (no drift between
+          // the stamp and the latch). null when no finite delay was supplied.
+          const rawDelay =
+            isPlainObject(input.tool_input) &&
+            typeof input.tool_input.delaySeconds === 'number' &&
+            Number.isFinite(input.tool_input.delaySeconds)
+              ? input.tool_input.delaySeconds
+              : null;
+          const stampDelaySec = rawDelay !== null ? clamp(Math.round(rawDelay), 60, 3600) : null;
           if (
             wakeupLevel === 'hard' &&
             wakeupWorst &&
@@ -1109,11 +1372,8 @@ export async function main(deps) {
             ) {
               // Build updatedInput from allowlist only.
               const updatedInput = {};
-              if (
-                typeof input.tool_input.delaySeconds === 'number' &&
-                Number.isFinite(input.tool_input.delaySeconds)
-              ) {
-                updatedInput.delaySeconds = input.tool_input.delaySeconds;
+              if (stampDelaySec !== null) {
+                updatedInput.delaySeconds = stampDelaySec;
               }
               updatedInput.prompt = RESUME_MARKER + ' ' + originalPrompt;
               if (typeof input.tool_input.reason === 'string') {
@@ -1130,6 +1390,36 @@ export async function main(deps) {
               deps.stdout(jsonOutput + '\n');
               log('wakeup_marked', { label: wakeupWorst.label, util: wakeupWorst.util });
             }
+          }
+
+          // Latch: record that a wakeup is now pending so subsequent non-resume
+          // re-drives (e.g. a /goal Stop-hook loop) are told to WAIT instead of
+          // stacking another wakeup. Authoritative — this is the one place we
+          // KNOW a wakeup is being scheduled. fs-only (never stdout), inside the
+          // try, throw-proof. Only within the 6h resume horizon; beyond it the
+          // resume chain terminates rather than sleeps, so a latch is moot.
+          if (
+            wakeupLevel === 'hard' &&
+            wakeupWorst &&
+            isPlainObject(input.tool_input) &&
+            wakeupWorst.reset.getTime() - deps.now().getTime() <= SIX_HOURS_MS
+          ) {
+            // Same value the stamp put into updatedInput.delaySeconds, so the
+            // latch and the actual wakeup never diverge. Fall back to the
+            // recommended hop delay when none was supplied.
+            const delaySec =
+              stampDelaySec !== null
+                ? stampDelaySec
+                : computeHopDelaySeconds(wakeupWorst, deps.now());
+            const nowMs = deps.now().getTime();
+            const pauseClean = validatePauseState(
+              {
+                resetAtMs: wakeupWorst.reset.getTime(),
+                nextWakeupAtMs: nowMs + delaySec * 1000,
+              },
+              nowMs,
+            );
+            if (pauseClean) await writePauseState(deps, pauseClean, log);
           }
         }
       } catch {
@@ -1167,8 +1457,21 @@ export async function main(deps) {
 
     if (eventName === 'PreToolUse') {
       if (level === 'hard' && worst) {
-        log('blocked', { label: worst.label, util: worst.util });
         const isSubagent = typeof input.agent_id === 'string' && input.agent_id.length > 0;
+        // Latch: if a wakeup is already pending, do NOT invite another — tell the
+        // model to stand down (breaks the degenerate re-hop loop). Sub-agents
+        // cannot ScheduleWakeup, so the WAIT path does not apply to them; they
+        // keep the existing return-a-resume-brief instruction.
+        if (!isSubagent) {
+          const pause = await readPauseState(deps);
+          if (decidePauseAction(pause, deps.now()) === 'wait') {
+            log('pause_wait', { label: worst.label, util: worst.util });
+            deps.stderr(buildPauseWaitMessage(worst, pause.nextWakeupAtMs) + '\n');
+            deps.exit(2);
+            return;
+          }
+        }
+        log('blocked', { label: worst.label, util: worst.util });
         deps.stderr(buildToolBlockMessage(worst, deps.now(), isSubagent) + '\n');
         deps.exit(2);
         return;
@@ -1194,6 +1497,9 @@ export async function main(deps) {
         deps.exit(2);
         return;
       }
+      // Recheck cleared the block (or is unreadable) → drop any pending pause
+      // latch so a future pause starts clean.
+      await clearPauseState(deps, log);
       if (windows.length === 0) {
         deps.stdout(buildRecheckUnreadableMessage() + '\n');
         log('ok', {});
@@ -1207,31 +1513,50 @@ export async function main(deps) {
     }
 
     if (level === 'hard' && worst) {
-      // Check if this is a resume hop.
+      // Resume hops are CARVED OUT of the pause latch: a fired resume-hop prompt
+      // is proof the wakeup fired, so always re-evaluate fresh — never WAIT it
+      // (else a buffer-early wakeup would be strangled and the chain would die).
       if (isResumeHopPrompt(input)) {
         // Resume hop: still blocked. Determine time-to-reset.
         const msToReset = worst.reset.getTime() - deps.now().getTime();
-        const sixHoursMs = 6 * 60 * 60 * 1000;
         log('resume_hop', { label: worst.label, util: worst.util });
-        if (msToReset <= sixHoursMs) {
-          // Within 6h: re-instruct reschedule.
+        if (msToReset <= SIX_HOURS_MS) {
+          // Within 6h: re-instruct a single reschedule.
           const line = formatSummary(windows) + buildResumeHopSuffix(worst, deps.now());
           deps.stdout(line + '\n');
           deps.exit(0);
           return;
         } else {
-          // Beyond 6h: chain-termination, no reschedule.
+          // Beyond 6h: chain-termination, no reschedule — drop the pending latch.
+          await clearPauseState(deps, log);
           const line = formatSummary(windows) + buildResumeTerminationSuffix(worst);
           deps.stdout(line + '\n');
           deps.exit(0);
           return;
         }
       }
-      // Normal hard block (no marker).
+      // Normal hard block (no marker). If a wakeup is already pending, stand down
+      // instead of inviting another — this is what breaks the degenerate re-hop
+      // loop driven by a /goal-style continuation.
+      const pause = await readPauseState(deps);
+      if (decidePauseAction(pause, deps.now()) === 'wait') {
+        log('pause_wait', { label: worst.label, util: worst.util });
+        deps.stderr(buildPauseWaitMessage(worst, pause.nextWakeupAtMs) + '\n');
+        deps.exit(2);
+        return;
+      }
       log('blocked', { label: worst.label, util: worst.util });
       deps.stderr(buildPromptBlockMessage(worst, cfg) + '\n');
       deps.exit(2);
       return;
+    }
+
+    // Past the hard block → not hard-blocked right now. If this was a resume hop,
+    // the pause is over (window reset or util fell below hard): drop any pending
+    // latch so a future pause starts clean. Covers both the silent-exit and the
+    // resume-ready stdout paths below.
+    if (isResumeHopPrompt(input)) {
+      await clearPauseState(deps, log);
     }
 
     if (windows.length === 0 || eventName !== 'UserPromptSubmit') {

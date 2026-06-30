@@ -24,6 +24,7 @@ import {
   CREDS_PATH,
   CLAUDE_DIR,
   DEBUG_LOG_PATH,
+  PAUSE_PATH,
   FIXED_NOW_MS,
   RESET_IN_3H,
   SENTINEL_TOKEN,
@@ -491,5 +492,44 @@ describe('T4 — Token leak guard (integration)', () => {
     assert.equal(exits[0], 0, 'SessionStart must exit 0');
     assert.equal(fetchCalls.length, 0, 'must not fetch on SessionStart');
     assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.13 session-start:');
+  });
+
+  // -------------------------------------------------------------------------
+  // T4.14 — pause-latch write channel (v0.6.0): the pause file is a new fs write
+  //         channel. With the sentinel present, it must carry ONLY the two
+  //         numbers and never the token.
+  // -------------------------------------------------------------------------
+  it('T4.14 ScheduleWakeup writes the pause latch → file holds only numbers, no sentinel anywhere', async () => {
+    const { deps, stdout, stderr, exits, fakeFs } = makeDeps({
+      env: { ...ENV, CLAUDE_USAGE_GUARD_DEBUG: '1' },
+      stdin: async () => JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'ScheduleWakeup',
+        tool_input: { delaySeconds: 1800, prompt: 'resume task', reason: 'quota' },
+      }),
+      // Hard cache (within 6h) so the latch is written; sentinel in creds.
+      initialFs: {
+        [CACHE_PATH]: makeCacheJson(FIXED_NOW_MS, {
+          five_hour: { utilization: 99, resets_at: RESET_IN_3H },
+        }),
+        [CREDS_PATH]: makeCredsJson(SENTINEL_TOKEN),
+      },
+      now: () => new Date(FIXED_NOW_MS),
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 0, 'ScheduleWakeup must exit 0');
+    // The latch file must actually have been written...
+    const pauseContent = fakeFs._peek(PAUSE_PATH);
+    assert.ok(pauseContent, 'pause latch must be written on this path');
+    // ...and contain ONLY the two numeric fields — no token, no creds key.
+    const parsed = JSON.parse(pauseContent);
+    assert.deepEqual(Object.keys(parsed).sort(), ['nextWakeupAtMs', 'resetAtMs']);
+    assert.equal(typeof parsed.resetAtMs, 'number');
+    assert.equal(typeof parsed.nextWakeupAtMs, 'number');
+    // Token must not appear in the latch (or any other channel, incl. tmp writes).
+    assert.ok(!pauseContent.includes(SENTINEL_TOKEN), 'sentinel must not be in the pause file');
+    assertNoTokenLeak({ stdout, stderr, fakeFs }, 'T4.14 pause-latch:');
   });
 });

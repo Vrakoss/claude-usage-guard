@@ -42,6 +42,11 @@ function makeEnv() {
   return {
     CLAUDE_USAGE_GUARD_WARN: String(WARN),
     CLAUDE_USAGE_GUARD_HARD: String(HARD),
+    // Pin the weekly thresholds to the SAME 80/95 so this matrix exercises the
+    // threshold mechanism uniformly across 5h and 7d windows. The per-window-
+    // class decoupling and its 90/95 defaults are covered in t17.
+    CLAUDE_USAGE_GUARD_WEEKLY_WARN: String(WARN),
+    CLAUDE_USAGE_GUARD_WEEKLY_HARD: String(HARD),
     CLAUDE_USAGE_GUARD_TTL: '3600', // 1 hour TTL — cache always fresh
   };
 }
