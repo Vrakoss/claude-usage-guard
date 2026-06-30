@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-30
+
+### Fixed
+
+- **Quota-pause no longer enters a degenerate re-hop loop (issue #5).** While hard-blocked,
+  Claude Code's `/goal` feature (a prompt-based `Stop` hook) re-drives the agent every turn.
+  Each re-drive the agent re-scheduled a wakeup — stacking dozens — and sometimes ran a shell
+  command to "check the reset", so usage *climbed while paused* (the guard burned the very
+  quota it exists to conserve).
+
+  A small pause-state file `~/.claude/usage-guard-pause.json` (numbers only —
+  `{ resetAtMs, nextWakeupAtMs }`, strict allowlist via `validatePauseState`, atomic `0o600`
+  write, fully fail-open) now records that a wakeup is already pending. It is written
+  authoritatively on the `ScheduleWakeup` path (the one place the guard knows a wakeup was
+  scheduled) and read on the two non-resume hard-block paths: if a wakeup is still pending the
+  guard emits a **WAIT** instruction ("a wakeup is already pending — do NOT schedule another,
+  do NOT probe usage, end the turn") instead of inviting yet another schedule. The block/hop
+  messages are now **goal-aware** and explicitly forbid shell/tool probes (the reset time is
+  already in the message). The reset boundary is latched once per pause and the existing
+  `+120s` buffer keeps the resume wakeup landing *after* reset.
+
+  A hook **cannot** make the agent genuinely idle while `/goal` is active — a `Stop` hook
+  cannot veto another hook's forced continuation ("any block wins"), and blocking would only
+  force more continuations. So the guard does **not** add a `Stop` hook; it minimizes the cost
+  of each forced re-drive (one wakeup pending, zero probes) until `/goal`'s own no-progress cap
+  yields.
+
+  Invariants preserved (test-enforced): the `RESUME_MARKER` resume-hop path is carved OUT of
+  the latch — a fired hop is proof the wakeup fired, so it always re-evaluates fresh and is
+  never strangled by a buffer-early WAIT (no stuck state). Fail-open is **asymmetric**: any
+  doubt (torn read, validation failure, poisoned far-future timestamp) → SCHEDULE, never WAIT,
+  so a corrupt/poisoned pause file can never silently disable blocking. The pause file holds
+  only two numbers and never the token; the `ScheduleWakeup` path still never exits 2 and a
+  pause-write failure can never trap it.
+
+### Added
+
+- **Separate weekly thresholds (`CLAUDE_USAGE_GUARD_WEEKLY_WARN` / `_WEEKLY_HARD`, defaults
+  90/95).** The `7d`, `7d-opus`, and `7d-sonnet` windows now take their own WARN/HARD so a
+  slowly filling weekly window no longer winds the agent down at the same low bar as the
+  volatile 5h window (which keeps the base `CLAUDE_USAGE_GUARD_WARN`/`_HARD`). `evaluateThresholds`
+  scores each window against *its* window-class thresholds and reports the most severe (which
+  is not necessarily the highest-utilization window). The weekly pair is validated and reset
+  independently (clamp `1..100`; `weeklyWarn >= weeklyHard` resets the pair to 90/95).
+
 ## [0.5.0] - 2026-06-17
 
 ### Fixed
