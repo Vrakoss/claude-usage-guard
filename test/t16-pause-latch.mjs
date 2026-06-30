@@ -471,4 +471,69 @@ describe('T16 — Pause latch', () => {
     // ...and the latch records the identical 60s.
     assert.equal(JSON.parse(fakeFs._peek(PAUSE_PATH)).nextWakeupAtMs, FIXED_NOW_MS + 60 * 1000);
   });
+
+  // -------------------------------------------------------------------------
+  // T16.17 Self-heal: a latch whose wakeup has ALREADY fired (nextWakeupAtMs in
+  // the past) must NOT cause a WAIT — it yields the SCHEDULE path so a fresh
+  // wakeup re-arms it. This is the no-stuck-state guarantee for the case where
+  // the single scheduled wakeup fired but the window is still hard.
+  // -------------------------------------------------------------------------
+  it('T16.17 fired latch (nextWakeupAtMs in the past) + still hard → normal block (schedule), not WAIT', async () => {
+    const firedLatch = JSON.stringify({
+      resetAtMs: FIXED_NOW_MS + 3 * 60 * 60 * 1000, // reset still in the future (valid)
+      nextWakeupAtMs: FIXED_NOW_MS - 1000, // wakeup already fired
+    });
+    const { deps, stderr, exits } = makeDeps({
+      env: ENV,
+      stdin: async () => JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash' }),
+      initialFs: {
+        [CACHE_PATH]: hardCache3h(),
+        [CREDS_PATH]: makeCredsJson('tok'),
+        [PAUSE_PATH]: firedLatch,
+      },
+      now: () => new Date(FIXED_NOW_MS),
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 2);
+    assert.ok(stderr[0].includes('ScheduleWakeup'), 'fired latch → schedule path, re-arms the wakeup');
+    assert.ok(!stderr[0].includes('ALREADY scheduled'), 'a fired wakeup must never WAIT (no stuck state)');
+  });
+
+  // -------------------------------------------------------------------------
+  // T16.18 Self-GC: a STALE latch (resetAtMs already passed) is ignored on read,
+  // so it can never cause a spurious WAIT on a later hard block — no unlink on
+  // the ordinary-prompt hot path is required to stay correct.
+  // -------------------------------------------------------------------------
+  it('T16.18 stale latch (resetAtMs in the past) + hard → ignored → normal block, not WAIT', async () => {
+    const staleLatch = JSON.stringify({
+      resetAtMs: FIXED_NOW_MS - 1000, // window already reset → validator drops it
+      nextWakeupAtMs: FIXED_NOW_MS - 2000,
+    });
+    const { deps, stderr, exits } = makeDeps({
+      env: ENV,
+      stdin: async () => JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash' }),
+      initialFs: {
+        [CACHE_PATH]: hardCache3h(),
+        [CREDS_PATH]: makeCredsJson('tok'),
+        [PAUSE_PATH]: staleLatch,
+      },
+      now: () => new Date(FIXED_NOW_MS),
+    });
+
+    await main(deps);
+
+    assert.equal(exits[0], 2);
+    assert.ok(stderr[0].includes('ScheduleWakeup'), 'stale latch is GC-on-read → schedule path');
+    assert.ok(!stderr[0].includes('ALREADY scheduled'), 'a stale latch must not cause a spurious WAIT');
+  });
+
+  // -------------------------------------------------------------------------
+  // T16.19 decidePauseAction boundary: now === nextWakeupAtMs → schedule (strict <)
+  // -------------------------------------------------------------------------
+  it('T16.19 decidePauseAction at exactly nextWakeupAtMs → schedule (predicate is strict <)', () => {
+    const pause = { resetAtMs: FIXED_NOW_MS + 3600_000, nextWakeupAtMs: FIXED_NOW_MS };
+    assert.equal(decidePauseAction(pause, new Date(FIXED_NOW_MS)), 'schedule');
+  });
 });

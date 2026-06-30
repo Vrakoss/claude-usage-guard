@@ -392,8 +392,12 @@ export function validatePauseState(raw, nowMs) {
  *                another (this is what breaks the degenerate re-hop loop).
  *   'schedule' — no pending wakeup (none recorded, or the recorded one has
  *                already fired); instruct/allow a single wakeup.
- * `pauseState` must already be validated (validatePauseState). Fail-open is
- * asymmetric: a null/expired/poisoned state yields 'schedule', never 'wait'.
+ * `pauseState` is normally a validatePauseState result (or null). The inline
+ * `typeof nextWakeupAtMs === 'number'` is defensive belt-and-suspenders so a
+ * caller (or future code path) passing an unvalidated/partial object can never
+ * trip a NaN/undefined comparison into a spurious 'wait'. Fail-open is
+ * asymmetric: a null/expired/poisoned/malformed state yields 'schedule', never
+ * 'wait'.
  */
 export function decidePauseAction(pauseState, now) {
   if (
@@ -1392,12 +1396,16 @@ export async function main(deps) {
             }
           }
 
-          // Latch: record that a wakeup is now pending so subsequent non-resume
+          // Latch: record that a wakeup is now pending so LATER non-resume
           // re-drives (e.g. a /goal Stop-hook loop) are told to WAIT instead of
           // stacking another wakeup. Authoritative — this is the one place we
           // KNOW a wakeup is being scheduled. fs-only (never stdout), inside the
           // try, throw-proof. Only within the 6h resume horizon; beyond it the
           // resume chain terminates rather than sleeps, so a latch is moot.
+          // This shrinks the loop, it does not eliminate it: a re-drive that
+          // reads the file in the brief window before this rename lands still
+          // sees no latch and may invite one more wakeup (the fix is best-effort
+          // de-duplication, not a hard lock — a hook cannot stop /goal anyway).
           if (
             wakeupLevel === 'hard' &&
             wakeupWorst &&
@@ -1551,10 +1559,13 @@ export async function main(deps) {
       return;
     }
 
-    // Past the hard block → not hard-blocked right now. If this was a resume hop,
-    // the pause is over (window reset or util fell below hard): drop any pending
-    // latch so a future pause starts clean. Covers both the silent-exit and the
-    // resume-ready stdout paths below.
+    // Past the hard block → not hard-blocked right now. A resume-hop prompt that
+    // reaches here means the window reset and the pause is genuinely over — clear
+    // the latch so the next pause starts clean. A normal (non-resume) prompt is
+    // deliberately NOT cleared here: the latch is self-GC'ing — validatePauseState
+    // treats a latch whose resetAtMs has passed as absent (so a stale latch can
+    // never cause a spurious WAIT), and the next pause overwrites it. That keeps
+    // an unlink syscall off the hot path of every ordinary prompt.
     if (isResumeHopPrompt(input)) {
       await clearPauseState(deps, log);
     }
