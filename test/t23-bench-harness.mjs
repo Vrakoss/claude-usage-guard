@@ -13,10 +13,15 @@
  *   - never wired into hooks/hooks.json, and importing it does nothing;
  *   - the docs that cite the timings name the harness.
  *
- * T23.9 spawns the harness for real (exec form only, one round) with an outer
+ * T23.11 spawns the harness for real (exec form only, one round) with an outer
  * home that holds a hard-blocking cache. If the harness ever stopped isolating
  * the home, the guard would read that cache, exit 2 on the Bash payload, and the
  * harness would abort, so the test goes red.
+ *
+ * T23.13 runs the harness against a copy of the guard whose cache schema version
+ * has drifted, so the guard rejects the seed and takes its cache-miss path. The
+ * harness's seed probe must catch that and abort before timing; without the probe
+ * the run would exit 0 and print "cache hit" medians, so the test goes red.
  */
 
 import { describe, it } from 'node:test';
@@ -150,6 +155,11 @@ describe('T23 timing harness — pure helpers', () => {
     assert.equal(cfg.debug, false);
     const { level } = evaluateThresholds(parseWindows(clean, new Date(nowMs + 1)), cfg);
     assert.equal(level, 'ok');
+    // The seed probe's cache must block, or the probe could not prove a cache hit.
+    const probe = validateCache(bench.buildSeedCache(nowMs, bench.PROBE_UTILIZATION), nowMs + 1);
+    assert.ok(probe && probe.fetchedAt === nowMs, 'guard must accept the probe seed as a fetch');
+    const probeEval = evaluateThresholds(parseWindows(probe, new Date(nowMs + 1)), cfg);
+    assert.equal(probeEval.level, 'hard', 'the probe seed must hard-block');
   });
 
   it('T23.10 benchEnv isolates the home and drops every inherited guard setting', () => {
@@ -203,6 +213,39 @@ describe('T23 timing harness — end to end', () => {
       );
     } finally {
       rmSync(outer, { recursive: true, force: true });
+    }
+  });
+
+  it('T23.13 a seed the guard does not honor aborts the run before any timing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cug-bench-drift-'));
+    try {
+      mkdirSync(join(root, 'scripts'));
+      writeFileSync(join(root, 'scripts', 'bench-hook-forms.mjs'), readFileSync(BENCH_PATH, 'utf8'));
+      // A guard copy whose cache schema has drifted: it rejects the harness's seed
+      // and takes the cache-miss path. The Keychain branch is switched off so the
+      // miss cannot reach a real macOS login; the temp home holds no credentials
+      // file, so the miss ends with no data and the guard allows the call.
+      let guard = readRepo('scripts/usage-guard.mjs');
+      const schemaLine = `export const CACHE_SCHEMA_VERSION = ${CACHE_SCHEMA_VERSION};`;
+      // Line endings vary with the checkout (core.autocrlf), hence \r?\n.
+      const keychainBranch = /if \(deps\.platform === 'darwin'\) \{(\r?\n\s*raw = await readTokenFromKeychain)/g;
+      assert.equal(guard.split(schemaLine).length, 2, 'guard declares CACHE_SCHEMA_VERSION once');
+      assert.equal([...guard.matchAll(keychainBranch)].length, 1, 'guard has one Keychain branch');
+      guard = guard
+        .replace(schemaLine, `export const CACHE_SCHEMA_VERSION = ${CACHE_SCHEMA_VERSION + 1};`)
+        .replace(keychainBranch, 'if (false) {$1');
+      writeFileSync(join(root, 'scripts', 'usage-guard.mjs'), guard);
+
+      const res = spawnSync(process.execPath, [join(root, 'scripts', 'bench-hook-forms.mjs'), '1', '--no-shell'], {
+        env: process.env,
+        encoding: 'utf8',
+        timeout: 60_000,
+      });
+      assert.equal(res.status, 1, `harness must abort, got ${res.status}: ${res.stdout}`);
+      assert.match(res.stderr, /^exec: seed probe got status 0\b/m);
+      assert.doesNotMatch(res.stdout, /median/, 'no timings may be printed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

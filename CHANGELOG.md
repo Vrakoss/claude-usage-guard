@@ -17,10 +17,13 @@ guard's behavior or to `hooks/hooks.json`.
   header comment documents the options. It is dev tooling only: never wired into the
   hooks, zero dependencies, no machine-specific paths. Every spawned guard runs against a
   throwaway home holding a seeded fresh cache, so it never reads a login token or calls the
-  network, and the harness aborts if a call exits non-zero, prints to stdout or touches
-  that home. A re-run in this release (Windows 11, Node 22, 20 interleaved runs, cache
-  hit) gave medians of 121.7 ms through Git Bash, 73.6 ms in exec form and 54.0 ms for a
-  bare `node -e 0`, in line with the 0.10.0 figures.
+  network. Before timing, a seed probe runs each guard form once against a seed at 100%
+  and requires a block (exit 2): only a guard that answers from the seeded cache can
+  block, so a cache miss (for example after a cache schema drift) aborts the run before
+  any timing. The harness also aborts if a timed call exits non-zero, prints to stdout or
+  touches that home. A re-run in this release (Windows 11, Node 22, 20 interleaved runs,
+  cache hit) gave medians of 121.7 ms through Git Bash, 73.6 ms in exec form and 54.0 ms
+  for a bare `node -e 0`, in line with the 0.10.0 figures.
 
 ### Documentation
 
@@ -34,9 +37,11 @@ guard's behavior or to `hooks/hooks.json`.
 - `test/t23-bench-harness.mjs` (new): the harness exists with a usage header, imports Node
   built-ins only, carries no machine-specific paths, never names fetch, a network module or
   the credentials file, is not wired into the hooks, and runs nothing on import. Its seeded
-  cache is checked against the guard's own `validateCache` and thresholds. One end-to-end
-  case runs a real exec-form round with a hard-blocking cache in the outer home: the run
-  only passes if the harness isolates the home.
+  cache and its probe seed are checked against the guard's own `validateCache` and
+  thresholds. One end-to-end case runs a real exec-form round with a hard-blocking cache in
+  the outer home: the run only passes if the harness isolates the home. Another runs the
+  harness against a guard copy with a drifted cache schema: the seed probe must abort the
+  run before it prints any timing.
 - `test/t19-hooks-config.mjs`: T19.18 now rejects any shell-form hook command string in
   README.md and CLAUDE.md (such as `node "${CLAUDE_PLUGIN_ROOT}/…"` or the script as
   `command`) instead of two exact removed sentences, with a self-check (T19.19). T19.15

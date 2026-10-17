@@ -25,13 +25,20 @@
  *
  * Safety: dev tooling only. It is never wired into hooks/hooks.json, and the guard
  * never imports it. Every spawned guard gets HOME/USERPROFILE pointed at a fresh
- * temp directory (deleted afterwards) that holds only a seeded, fresh usage cache
- * well below every threshold, and all inherited CLAUDE_USAGE_GUARD_* settings are
- * dropped. The guard therefore answers from that cache: it never reads the real
- * ~/.claude, never looks up a login token and never calls the network. After every
- * call the harness checks that the call exited 0 with empty stdout and left the
- * temp home byte-for-byte unchanged (a cache miss would have written a marker), and
- * aborts otherwise. Zero dependencies: Node >= 18 built-ins only. Importing this
+ * temp directory (deleted afterwards) that holds only a seeded, fresh usage cache,
+ * and all inherited CLAUDE_USAGE_GUARD_* settings are dropped.
+ *
+ * Seed probe: before any timing, each guard form runs once against a seed at 100%
+ * and must exit 2 (blocked). Only a guard that reads and accepts the seeded cache
+ * can block: on a cache miss (for example after a cache schema drift) it finds no
+ * login in the temp home and allows the call, so the harness aborts before timing
+ * anything. A probe call is the only call that can reach the login lookup (on macOS
+ * the Keychain), and only if the seed is rejected; test T23.9 pins the seed against
+ * the guard's schema so that never happens. The harness then writes the timing seed,
+ * far below every threshold, and the guard answers every timed call from it: it
+ * never reads the real ~/.claude, never looks up a login token and never calls the
+ * network. Every timed call must exit 0 with empty stdout, and every guard call must
+ * leave the temp home byte-for-byte unchanged, or the harness aborts. Zero dependencies: Node >= 18 built-ins only. Importing this
  * module performs no I/O; the pure helpers are exported for test/t23-bench-harness.mjs.
  */
 
@@ -99,15 +106,23 @@ export function gitBashCandidates(execPath) {
   return [join(gitRoot, 'bin', 'bash.exe'), join(gitRoot, 'usr', 'bin', 'bash.exe')];
 }
 
-/** Returns a usage cache, fetched at `nowMs`, that is valid and far below every threshold. */
-export function buildSeedCache(nowMs) {
+// Utilization of the probe seed: at or above every hard threshold, so the guard blocks.
+export const PROBE_UTILIZATION = 100;
+// Utilization of the timing seed: far below every threshold, so the guard allows.
+export const TIMING_UTILIZATION = 1;
+
+/**
+ * Returns a valid usage cache fetched at `nowMs`, with both windows at
+ * `utilization` percent (default: the timing seed, far below every threshold).
+ */
+export function buildSeedCache(nowMs, utilization = TIMING_UTILIZATION) {
   return {
     schemaVersion: CACHE_SCHEMA_VERSION,
     fetchedAt: nowMs,
     failedAt: null,
     windows: {
-      five_hour: { utilization: 1, resets_at: new Date(nowMs + 4 * HOUR_MS).toISOString() },
-      seven_day: { utilization: 1, resets_at: new Date(nowMs + 72 * HOUR_MS).toISOString() },
+      five_hour: { utilization, resets_at: new Date(nowMs + 4 * HOUR_MS).toISOString() },
+      seven_day: { utilization, resets_at: new Date(nowMs + 72 * HOUR_MS).toISOString() },
     },
   };
 }
@@ -142,14 +157,35 @@ function resolveBash(env) {
   return found;
 }
 
+/** Throws if the spawn itself failed (missing or non-executable program). */
+function assertSpawned(name, r) {
+  if (r.error) {
+    throw new Error(`${name}: spawn failed (${r.error.code ?? 'error'}); is it a real executable on PATH?`);
+  }
+}
+
+/**
+ * Runs one seed-probe call against the probe seed. The guard must block (exit 2,
+ * empty stdout); exit 0 means it never answered from the seeded cache. Aborts otherwise.
+ */
+function probeCall(name, fn, checkHome) {
+  const r = fn();
+  assertSpawned(name, r);
+  if (r.status !== 2 || r.stdout.length !== 0) {
+    throw new Error(
+      `${name}: seed probe got status ${r.status} and ${r.stdout.length} stdout bytes, ` +
+        'expected a block (status 2): the guard did not answer from the seeded cache (cache miss?)',
+    );
+  }
+  checkHome(name);
+}
+
 /** Runs one call, returns its wall time in ms, and aborts on any deviation. */
 function timeCall(name, fn, checkHome) {
   const t0 = process.hrtime.bigint();
   const r = fn();
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-  if (r.error) {
-    throw new Error(`${name}: spawn failed (${r.error.code ?? 'error'}); is it a real executable on PATH?`);
-  }
+  assertSpawned(name, r);
   if (r.status !== 0 || r.stdout.length !== 0) {
     const err = String(r.stderr ?? '').slice(0, 300);
     throw new Error(`${name}: status ${r.status}, ${r.stdout.length} stdout bytes; stderr: ${err}`);
@@ -169,8 +205,12 @@ function run(argv, env) {
   try {
     const claudeDir = join(home, '.claude');
     mkdirSync(claudeDir);
-    const seedText = JSON.stringify(buildSeedCache(Date.now()));
-    writeFileSync(join(claudeDir, CACHE_FILE), seedText, { mode: 0o600 });
+    const cachePath = join(claudeDir, CACHE_FILE);
+    let seedText = '';
+    const writeSeed = (utilization) => {
+      seedText = JSON.stringify(buildSeedCache(Date.now(), utilization));
+      writeFileSync(cachePath, seedText, { mode: 0o600 });
+    };
     const runEnv = benchEnv(env, home, posixRoot);
     const payload = JSON.stringify({
       session_id: 'bench',
@@ -187,7 +227,7 @@ function run(argv, env) {
       const same =
         top.length === 1 && top[0] === '.claude' &&
         inner.length === 1 && inner[0] === CACHE_FILE &&
-        readFileSync(join(claudeDir, CACHE_FILE), 'utf8') === seedText;
+        readFileSync(cachePath, 'utf8') === seedText;
       if (!same) throw new Error(`${name}: the guard changed the bench home (cache miss?)`);
     };
 
@@ -202,6 +242,12 @@ function run(argv, env) {
     forms.exec = () => spawnSync('node', [script], { input: payload, env: runEnv });
     forms.bareNode = () => spawnSync('node', ['-e', '0'], { env: runEnv });
 
+    // Prove every guard form answers from the seeded cache before timing anything.
+    writeSeed(PROBE_UTILIZATION);
+    for (const [name, fn] of Object.entries(forms)) {
+      if (name !== 'bareNode') probeCall(name, fn, checkHome);
+    }
+    writeSeed(TIMING_UTILIZATION);
     for (const [name, fn] of Object.entries(forms)) {
       for (let i = 0; i < WARMUP_RUNS; i++) timeCall(name, fn, checkHome);
     }
@@ -212,7 +258,7 @@ function run(argv, env) {
 
     const lines = [
       `node ${process.version} on ${process.platform}, ${opts.runs} runs per form, interleaved, ` +
-        'PreToolUse/Bash payload, cache hit',
+        'PreToolUse/Bash payload, cache hit (seed probe blocked as expected)',
     ];
     for (const [name, xs] of Object.entries(samples)) {
       const s = [...xs].sort((a, b) => a - b);
