@@ -48,6 +48,11 @@
 //    path may stamp the RESUME_MARKER onto an unmarked wakeup prompt (one JSON
 //    line stdout) when hard-blocked, to ensure the wake turn is recognized as
 //    a resume hop and handled correctly by the UserPromptSubmit branch.
+//    hooks/hooks.json (v0.8.0, issue #11) matches PreToolUse on every tool
+//    EXCEPT a denylist (Read, Grep, Glob, LSP, ToolSearch, TodoWrite,
+//    TaskOutput, TaskStop, SubagentHandback, StructuredOutput) via a JS-RegExp
+//    negative lookahead, so those tools never spawn this script. Unknown and
+//    future tools, every mcp__* tool and ScheduleWakeup stay matched.
 //
 // PAUSE LATCH (v0.6.0): a degenerate re-hop loop was reported (issue #5) — while
 // hard-blocked, Claude Code's /goal feature (a prompt-based Stop hook) re-drives
@@ -202,6 +207,16 @@ const REDACTED = '[redacted]';
 // fired during a hard-block. The guard lets these through the prompt gate
 // and re-instructs the model to reschedule or resume depending on state.
 // ---------------------------------------------------------------------------
+
+/**
+ * Tools a sub-agent uses to hand its result back to its caller
+ * (SubagentHandback for Agent/Task sub-agents, StructuredOutput for workflow
+ * agents). hooks/hooks.json leaves them ungated (issue #11), and the sub-agent
+ * HARD block message names them so the model knows the brief can still be
+ * delivered. test/t19-hooks-config.mjs asserts every name here is ungated by
+ * the PreToolUse matcher, so the message and the matcher cannot drift apart.
+ */
+export const HANDBACK_TOOLS = Object.freeze(['SubagentHandback', 'StructuredOutput']);
 
 /**
  * Marker prefix stamped onto wakeup prompts by the ScheduleWakeup hook path
@@ -767,7 +782,9 @@ export function buildToolBlockMessage(worst, now, isSubagent) {
     return (
       `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
       `You are a sub-agent: ScheduleWakeup is NOT available here. ` +
-      `All tools are gated. STOP now — return a resume brief to your caller: ` +
+      `Work tools (shell, edits, web, agents, MCP) are gated; the hand-back tools ` +
+      `(${HANDBACK_TOOLS.join(', ')}) are NOT. STOP work now and use your hand-back tool ` +
+      `to return a resume brief to your caller: ` +
       `summarize current state, remaining steps, and exact relaunch instructions ` +
       `(context, tool calls, arguments). Your caller will relaunch you after reset.`
     );
@@ -810,7 +827,7 @@ export function buildResumeHopSuffix(worst, now) {
     `Do NOT run shell or any other tool to check usage/reset — probing burns quota. ` +
     `If a goal or autonomous loop re-drives you before that wakeup fires, it cannot make ` +
     `progress until reset: just end the turn without scheduling again. ` +
-    `All other tools are gated/denied.`
+    `Work tools (shell, edits, web, agents, MCP) stay gated/denied.`
   );
 }
 

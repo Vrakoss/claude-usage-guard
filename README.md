@@ -51,11 +51,60 @@ Reset times are shown in your **local timezone** with fixed English labels, e.g.
 | `PreToolUse` | worst `< HARD` | Allowed silently (no stdout, per hook contract) | `0` |
 | `PreToolUse` | worst `≥ HARD`, reset **≤ 6h** away | **Blocks the tool**; instructs the model to call `ScheduleWakeup` until reset, then resume | `2` |
 | `PreToolUse` | worst `≥ HARD`, reset **> 6h** away | **Blocks the tool**; instructs the model to wrap up, summarize, and end the turn | `2` |
+| `PreToolUse` | tool is ungated: `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TodoWrite`, `TaskOutput`, `TaskStop`, `SubagentHandback`, `StructuredOutput` | Hook not invoked (no process is spawned) | — |
+
+### Which tools are gated
+
+`PreToolUse` fires on **every tool except the ten ungated ones above**. The matcher in
+`hooks/hooks.json` is a denylist written as a JavaScript regular expression with a negative
+lookahead:
+
+```text
+^(?!(?:Read|Grep|Glob|LSP|ToolSearch|TodoWrite|TaskOutput|TaskStop|SubagentHandback|StructuredOutput)$)
+```
+
+- **Everything else stays gated**, including `ScheduleWakeup` (which stays exempt inside the
+  guard), `Bash`, `PowerShell`, `Edit`/`Write`, `Agent`/`Task`, `Workflow`, web tools, every
+  `mcp__*` tool, and any tool Claude Code adds later. Only exact names are exempt:
+  `mcp__fs__Read` or `ReadX` are still gated.
+- **Why these ten:** the read-only/local tools are cheap and cannot spend real quota on
+  their own. Each call used to cost a Git Bash + Node spawn (~165 ms on Windows). On one
+  measured workload (215k tool calls from a single developer's last 60 days) all ten ungated
+  tools together were about 9% of tool calls; the read-only/local subset alone was about 5%,
+  and the hand-back tools `StructuredOutput` and `SubagentHandback` most of the rest. The wind-down tools must stay usable at HARD:
+  a hard-blocked sub-agent is told to return a resume brief to its caller, and with the old
+  `*` matcher the hand-back tool (`SubagentHandback`, or `StructuredOutput` for workflow
+  agents) was itself blocked, so the brief was lost. `TaskStop` lets the model halt
+  background work while paused.
+
+**Trade-offs (residual risks):**
+
+1. **Ungated tools run past HARD.** A run of only ungated tools (for example a burst of
+   `Read`/`Grep`) continues until the next gated call or the end of the turn. The next
+   prompt is still blocked by `UserPromptSubmit`. In practice almost every turn reaches a
+   `Bash`/`Edit` call, so the overrun is short. This is **not configurable** from the plugin:
+   a plugin matcher cannot read user settings, and an environment variable cannot bring back
+   a hook call that never happened. If you want strict all-tool gating, add your own
+   `PreToolUse` hook with `"matcher": "*"` to `~/.claude/settings.json` that runs the
+   installed `scripts/usage-guard.mjs` with `node`.
+2. **The matcher relies on Claude Code's JavaScript-RegExp matcher semantics.** Claude Code
+   documents that a matcher containing characters other than letters, digits, `_`, `-`,
+   spaces, `,` and `|` is an unanchored JavaScript regular expression tested with
+   `RegExp.prototype.test`. If that engine ever changed, the lookahead could stop working.
+   The test suite (`test/t19-hooks-config.mjs`) pins the matcher contract, but it cannot
+   detect a change in Claude Code itself.
+
+The hooks stay in **shell form** (`"command": "node \"${CLAUDE_PLUGIN_ROOT}/…\""`). Exec
+form (`command` + `args`) would skip the Git Bash process on Windows, but Claude Code
+versions before 2.1.139 silently drop the `args` key and would run a bare `node` that reads
+the hook payload as a script. That turns the guard off without telling the user, and a
+plugin cannot require a minimum Claude Code version.
 
 ### Gate-and-self-sleep pause design
 
-When a **short** (5-hour) window is exhausted mid-task, blocking every tool *except*
-`ScheduleWakeup` turns the limit into a **pause** rather than a failure: the model is told
+When a **short** (5-hour) window is exhausted mid-task, blocking every gated tool (see
+[Which tools are gated](#which-tools-are-gated)) while exempting `ScheduleWakeup` turns the
+limit into a **pause** rather than a failure: the model is told
 to schedule a wakeup (chaining 3600s sleeps if needed) and resume the same task after the
 reset. `ScheduleWakeup` itself is always exempt from the gate, so the model can never be
 trapped — it can always schedule its own wakeup.
@@ -72,7 +121,8 @@ when a `ScheduleWakeup` is dispatched while hard-blocked, the guard intercepts t
 `updatedInput`, and then exits 0. On each subsequent hop, the guard checks whether the
 window has reset:
 - **Still blocked (≤ 6h to reset):** re-instructs the model to reschedule with the same
-  marked prompt and the computed delay; all other tools remain gated.
+  marked prompt and the computed delay; every other gated tool (see
+  [Which tools are gated](#which-tools-are-gated)) stays blocked.
 - **Still blocked (> 6h to reset):** instructs chain termination — summarize the task
   state for the user and end the turn; do not reschedule for days.
 - **Window has reset** (dropped by `parseWindows` because `resets_at` is now in the
@@ -84,7 +134,8 @@ window has reset:
 Sub-agents (detected via the `agent_id` field in the `PreToolUse` hook input) cannot call
 `ScheduleWakeup` — it is only available on the main agent thread. When a sub-agent is
 hard-blocked, the guard instructs it to **abort immediately** and return a resume brief to
-its caller: current state, remaining steps, and exact relaunch instructions (context, tool
+its caller through its hand-back tool (`SubagentHandback`, or `StructuredOutput` for
+workflow agents), which stays ungated for exactly this purpose: current state, remaining steps, and exact relaunch instructions (context, tool
 calls, arguments). The caller embeds this brief in the wakeup prompt
 (after `[usage-guard:resume]`) so the sub-agent can be relaunched fresh after reset with
 full context.

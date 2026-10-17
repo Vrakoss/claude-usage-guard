@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "^(?!(?:Read|Grep|Glob|LSP|ToolSearch|TodoWrite|TaskOutput|TaskStop|SubagentHandback|StructuredOutput)$)",
         "hooks": [
           {
             "type": "command",
