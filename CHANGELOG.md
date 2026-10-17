@@ -41,7 +41,8 @@ guard's behavior or to `hooks/hooks.json`.
   thresholds. One end-to-end case runs a real exec-form round with a hard-blocking cache in
   the outer home: the run only passes if the harness isolates the home. Another runs the
   harness against a guard copy with a drifted cache schema: the seed probe must abort the
-  run before it prints any timing.
+  run before it prints any timing. A third runs it against a guard copy that writes a stray
+  file into its home on every call: the home check must abort the run before any timing.
 - `test/t19-hooks-config.mjs`: T19.18 now rejects any shell-form hook command string in
   README.md and CLAUDE.md (such as `node "${CLAUDE_PLUGIN_ROOT}/…"` or the script as
   `command`) instead of two exact removed sentences, with a self-check (T19.19). T19.15

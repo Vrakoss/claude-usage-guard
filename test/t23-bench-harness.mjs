@@ -22,6 +22,10 @@
  * has drifted, so the guard rejects the seed and takes its cache-miss path. The
  * harness's seed probe must catch that and abort before timing; without the probe
  * the run would exit 0 and print "cache hit" medians, so the test goes red.
+ *
+ * T23.14 runs the harness against a copy of the guard that writes a stray file
+ * into its ~/.claude on every call. The harness's home check must abort before
+ * timing; without the check the run would exit 0 and print medians.
  */
 
 import { describe, it } from 'node:test';
@@ -243,6 +247,45 @@ describe('T23 timing harness — end to end', () => {
       });
       assert.equal(res.status, 1, `harness must abort, got ${res.status}: ${res.stdout}`);
       assert.match(res.stderr, /^exec: seed probe got status 0\b/m);
+      assert.doesNotMatch(res.stdout, /median/, 'no timings may be printed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('T23.14 a guard that writes into the bench home aborts the run before any timing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cug-bench-dirty-'));
+    try {
+      mkdirSync(join(root, 'scripts'));
+      writeFileSync(join(root, 'scripts', 'bench-hook-forms.mjs'), readFileSync(BENCH_PATH, 'utf8'));
+      // A guard copy that drops a stray file into its ~/.claude on every call but
+      // otherwise behaves (the probe still blocks, timed calls still allow). Only
+      // the harness's home check can catch it. The write is confined to a home
+      // the harness made (basename ug-bench-*) so a broken isolation can never
+      // touch the real ~/.claude.
+      const guard = readRepo('scripts/usage-guard.mjs');
+      const firstImport = "import { fileURLToPath } from 'node:url';";
+      assert.equal(guard.split(firstImport).length, 2, 'guard has one node:url import line');
+      const stray = [
+        "import { writeFileSync as strayWrite } from 'node:fs';",
+        "import { homedir as strayHome } from 'node:os';",
+        "import { basename as strayBase, join as strayJoin } from 'node:path';",
+        "if (strayBase(strayHome()).startsWith('ug-bench-')) {",
+        "  strayWrite(strayJoin(strayHome(), '.claude', 'stray.txt'), 'x');",
+        '}',
+      ].join('\n');
+      writeFileSync(
+        join(root, 'scripts', 'usage-guard.mjs'),
+        guard.replace(firstImport, `${firstImport}\n${stray}`),
+      );
+
+      const res = spawnSync(process.execPath, [join(root, 'scripts', 'bench-hook-forms.mjs'), '1', '--no-shell'], {
+        env: process.env,
+        encoding: 'utf8',
+        timeout: 60_000,
+      });
+      assert.equal(res.status, 1, `harness must abort, got ${res.status}: ${res.stdout}`);
+      assert.match(res.stderr, /^exec: the guard changed the bench home\b/m);
       assert.doesNotMatch(res.stdout, /median/, 'no timings may be printed');
     } finally {
       rmSync(root, { recursive: true, force: true });
