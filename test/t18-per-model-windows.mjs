@@ -167,7 +167,8 @@ describe('T18 — bounded window count', () => {
     assert.equal(MAX_WINDOWS, 16);
     const body = {};
     // Extra keys FIRST in payload order, so a naive first-N cut would drop the known ones.
-    for (let i = 0; i < 40; i++) {
+    // Added in DESCENDING order (m39..m00), so only a real sort keeps m00..m11.
+    for (let i = 39; i >= 0; i--) {
       body[`seven_day_m${String(i).padStart(2, '0')}`] = { utilization: 1, resets_at: RESET_IN_8H };
     }
     body.five_hour = { utilization: 10, resets_at: RESET_IN_3H };
@@ -184,9 +185,27 @@ describe('T18 — bounded window count', () => {
     }
     // Deterministic: the surviving extras are the lexicographically first ones.
     const extras = keys.filter((k) => k.startsWith('seven_day_m'));
-    assert.deepEqual(extras, extras.slice().sort());
-    assert.equal(extras[0], 'seven_day_m00');
-    assert.equal(extras.length, MAX_WINDOWS - 4);
+    const expected = Array.from({ length: MAX_WINDOWS - 4 }, (_, i) => `seven_day_m${String(i).padStart(2, '0')}`);
+    assert.deepEqual(extras, expected);
+  });
+
+  it('T18.7b parseWindows applies the bound itself on unvalidated input', () => {
+    const windows = {};
+    for (let i = 39; i >= 0; i--) {
+      windows[`seven_day_q${String(i).padStart(2, '0')}`] = { utilization: 1, resets_at: RESET_IN_8H };
+    }
+    windows.five_hour = { utilization: 10, resets_at: RESET_IN_3H };
+    windows.seven_day = { utilization: 20, resets_at: RESET_IN_8H };
+    windows.seven_day_opus = { utilization: 30, resets_at: RESET_IN_8H };
+    windows.seven_day_sonnet = { utilization: 40, resets_at: RESET_IN_8H };
+    // Deliberately NOT passed through validateCache: parseWindows must bound on its own.
+    const out = parseWindows({ windows }, NOW);
+    assert.equal(out.length, MAX_WINDOWS);
+    const labels = out.map((w) => w.label);
+    for (const l of ['5h', '7d', '7d-opus', '7d-sonnet']) {
+      assert.ok(labels.includes(l), `classic window ${l} must be kept`);
+    }
+    assert.equal(labels[4], '7d-q00');
   });
 
   it('T18.8 the bound also applies on cache read (poisoned oversized cache file)', () => {
