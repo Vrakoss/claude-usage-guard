@@ -48,6 +48,11 @@
 //    path may stamp the RESUME_MARKER onto an unmarked wakeup prompt (one JSON
 //    line stdout) when hard-blocked, to ensure the wake turn is recognized as
 //    a resume hop and handled correctly by the UserPromptSubmit branch.
+//    hooks/hooks.json (v0.8.0, issue #11) matches PreToolUse on every tool
+//    EXCEPT a denylist (Read, Grep, Glob, LSP, ToolSearch, TodoWrite,
+//    TaskOutput, TaskStop, SubagentHandback, StructuredOutput) via a JS-RegExp
+//    negative lookahead, so those tools never spawn this script. Unknown and
+//    future tools, every mcp__* tool and ScheduleWakeup stay matched.
 //
 // PAUSE LATCH (v0.6.0): a degenerate re-hop loop was reported (issue #5) — while
 // hard-blocked, Claude Code's /goal feature (a prompt-based Stop hook) re-drives

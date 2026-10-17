@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-17
+
+### Changed
+
+- **`PreToolUse` no longer runs on every tool (issue #11).** The matcher went from `*` to a
+  denylist written as a JavaScript-RegExp negative lookahead. The guard is not spawned for
+  `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TodoWrite`, `TaskOutput`, `TaskStop`,
+  `SubagentHandback` and `StructuredOutput`. Everything else stays gated, including
+  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On a measured 215k-call local
+  workload this skips ~9% of hook spawns, each one a Git Bash + Node pair costing ~165 ms on
+  Windows.
+- README documents the gated set and its trade-offs: ungated tools can keep running past
+  HARD until the next gated call, and the matcher relies on Claude Code's documented
+  JavaScript-RegExp matcher semantics.
+
+### Fixed
+
+- **A hard-blocked sub-agent can now return its resume brief.** The block message tells a
+  sub-agent to hand a resume brief back to its caller, but with matcher `*` the hand-back
+  tool (`SubagentHandback`, or `StructuredOutput` for workflow agents) was blocked too, so
+  the brief was lost. Both are now ungated, and so is `TaskStop`, so a paused model can still
+  halt background work.
+
+### Not changed
+
+- The hooks stay in shell form. Exec form (`command` + `args`) would skip the Git Bash
+  process on Windows, but clients older than Claude Code 2.1.139 drop `args` and run a bare
+  `node` that evaluates the hook payload as a script. That silently disables the guard, and
+  a plugin cannot declare a minimum client version, so exec form is deferred.
+
 ## [0.7.0] - 2026-10-17
 
 ### Added
