@@ -209,6 +209,16 @@ const REDACTED = '[redacted]';
 // ---------------------------------------------------------------------------
 
 /**
+ * Tools a sub-agent uses to hand its result back to its caller
+ * (SubagentHandback for Agent/Task sub-agents, StructuredOutput for workflow
+ * agents). hooks/hooks.json leaves them ungated (issue #11), and the sub-agent
+ * HARD block message names them so the model knows the brief can still be
+ * delivered. test/t19-hooks-config.mjs asserts every name here is ungated by
+ * the PreToolUse matcher, so the message and the matcher cannot drift apart.
+ */
+export const HANDBACK_TOOLS = Object.freeze(['SubagentHandback', 'StructuredOutput']);
+
+/**
  * Marker prefix stamped onto wakeup prompts by the ScheduleWakeup hook path
  * when the guard is hard-blocked. NEVER change this string — it is a
  * compatibility contract across plugin versions.
@@ -772,7 +782,9 @@ export function buildToolBlockMessage(worst, now, isSubagent) {
     return (
       `QUOTA GUARD: ${worst.label} window at ${worst.util}%. ` +
       `You are a sub-agent: ScheduleWakeup is NOT available here. ` +
-      `All tools are gated. STOP now — return a resume brief to your caller: ` +
+      `Work tools (shell, edits, web, agents, MCP) are gated; the hand-back tools ` +
+      `(${HANDBACK_TOOLS.join(', ')}) are NOT. STOP work now and use your hand-back tool ` +
+      `to return a resume brief to your caller: ` +
       `summarize current state, remaining steps, and exact relaunch instructions ` +
       `(context, tool calls, arguments). Your caller will relaunch you after reset.`
     );
@@ -815,7 +827,7 @@ export function buildResumeHopSuffix(worst, now) {
     `Do NOT run shell or any other tool to check usage/reset — probing burns quota. ` +
     `If a goal or autonomous loop re-drives you before that wakeup fires, it cannot make ` +
     `progress until reset: just end the turn without scheduling again. ` +
-    `All other tools are gated/denied.`
+    `Work tools (shell, edits, web, agents, MCP) stay gated/denied.`
   );
 }
 

@@ -15,13 +15,19 @@
  * is silently off. Plugins cannot declare an enforced minimum client version, so
  * exec form is not shipped (see the issue #11 supervisor ruling).
  *
- * Pure: reads the JSON file only, so it runs in every CI cell.
+ * The sub-agent HARD block message names the hand-back tools (HANDBACK_TOOLS)
+ * as still usable; T19.10-T19.12 tie that message to the matcher so the two
+ * cannot drift apart (the message once claimed "All tools are gated").
+ *
+ * Pure: reads the JSON file and imports the guard module (zero I/O on import),
+ * so it runs in every CI cell.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { HANDBACK_TOOLS, buildToolBlockMessage, buildResumeHopSuffix } from '../scripts/usage-guard.mjs';
 
 const HOOKS_PATH = fileURLToPath(new URL('../hooks/hooks.json', import.meta.url));
 const config = JSON.parse(readFileSync(HOOKS_PATH, 'utf8'));
@@ -131,5 +137,42 @@ describe('T19 hooks.json — PreToolUse denylist matcher', () => {
     assert.equal(matches('Read|Grep', 'mcp__fs__Read'), false);
     assert.equal(matches('Read|Grep', 'ReadX'), false);
     assert.equal(matches('Edit.*', 'NotebookEdit'), true); // regex path is unanchored
+  });
+});
+
+describe('T19 sub-agent block message agrees with the matcher', () => {
+  const { matcher } = soleHook('PreToolUse').group;
+  const now = new Date(Date.UTC(2026, 10, 15, 12, 0, 0));
+  const worst = { label: '5h', util: 99, reset: new Date(now.getTime() + 2 * 3600 * 1000) };
+  const msg = buildToolBlockMessage(worst, now, true);
+
+  it('T19.10 HANDBACK_TOOLS is exactly SubagentHandback and StructuredOutput', () => {
+    assert.deepEqual([...HANDBACK_TOOLS], ['SubagentHandback', 'StructuredOutput']);
+    assert.ok(Object.isFrozen(HANDBACK_TOOLS));
+  });
+
+  for (const name of HANDBACK_TOOLS) {
+    it(`T19.11 hand-back tool ${name} is ungated and named in the sub-agent message`, () => {
+      assert.equal(matches(matcher, name), false, `${name} must not be gated by hooks.json`);
+      assert.ok(msg.includes(name), `sub-agent message must name ${name}`);
+    });
+  }
+
+  it('T19.12 sub-agent message no longer claims every tool is gated', () => {
+    assert.doesNotMatch(msg, /all tools are gated/i);
+    assert.match(msg, /hand-back tools \(SubagentHandback, StructuredOutput\) are NOT/);
+    assert.match(msg, /resume brief to your caller/);
+    assert.match(msg, /ScheduleWakeup is NOT available/);
+  });
+
+  it('T19.13 main-thread messages are unchanged by the hand-back wording', () => {
+    const main = buildToolBlockMessage(worst, now, false);
+    assert.ok(!main.includes('hand-back'), 'main-thread pause message must not mention hand-back');
+  });
+
+  it('T19.14 resume-hop suffix no longer claims every other tool is gated', () => {
+    const suffix = buildResumeHopSuffix(worst, now);
+    assert.doesNotMatch(suffix, /all other tools are gated/i);
+    assert.match(suffix, /Work tools \(shell, edits, web, agents, MCP\) stay gated/);
   });
 });

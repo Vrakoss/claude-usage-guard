@@ -12,8 +12,9 @@ All notable changes to this project are documented here. The format is based on
   denylist written as a JavaScript-RegExp negative lookahead. The guard is not spawned for
   `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TodoWrite`, `TaskOutput`, `TaskStop`,
   `SubagentHandback` and `StructuredOutput`. Everything else stays gated, including
-  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On a measured 215k-call local
-  workload this skips ~9% of hook spawns, each one a Git Bash + Node pair costing ~165 ms on
+  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one measured 215k-call local
+  workload the ten ungated tools together were ~9% of tool calls (the read-only/local subset
+  ~5%), so ~9% of hook spawns are skipped, each one a Git Bash + Node pair costing ~165 ms on
   Windows.
 - README documents the gated set and its trade-offs: ungated tools can keep running past
   HARD until the next gated call, and the matcher relies on Claude Code's documented
@@ -26,6 +27,12 @@ All notable changes to this project are documented here. The format is based on
   tool (`SubagentHandback`, or `StructuredOutput` for workflow agents) was blocked too, so
   the brief was lost. Both are now ungated, and so is `TaskStop`, so a paused model can still
   halt background work.
+- **Block messages no longer claim every tool is gated.** The sub-agent HARD message now says
+  work tools are gated but the hand-back tools (`SubagentHandback`, `StructuredOutput`) are
+  not, and tells the sub-agent to use one to return its brief. The names come from the new
+  exported `HANDBACK_TOOLS` constant, and `test/t19-hooks-config.mjs` checks each one is
+  ungated by the matcher. The resume-hop suffix's "All other tools are gated" line was
+  reworded the same way.
 
 ### Not changed
 
