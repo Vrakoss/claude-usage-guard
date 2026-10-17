@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-17
+
+### Added
+
+- **Every per-model usage window is kept (issue #10).** The window set used to be a fixed
+  allowlist (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`), so a window
+  such as `seven_day_fable` — or any future per-model window — was dropped before
+  evaluation and never reached the cache. Any `seven_day_<model>` / `five_hour_<model>` key
+  matching a strict grammar (lowercase alphanumeric segments, max 48 chars) is now accepted
+  with the same per-entry validation (finite utilization clamped `0..100`, parseable
+  `resets_at`). New keys get a derived label (`seven_day_fable` → `7d-fable`) and the weekly
+  thresholds (`5h-<model>` gets the base ones). They appear in the `[usage]` status line, in
+  threshold evaluation, and in the cache.
+- **Bounded window count.** At most 16 windows are accepted (`MAX_WINDOWS`), the four
+  classic ones always first and the rest in sorted key order, so a poisoned payload cannot
+  bloat the cache file or the status line.
+- **Versioned cache schema.** `~/.claude/usage-guard-cache.json` now carries
+  `schemaVersion: 1` and is documented in the README as a stable read-only contract
+  (`{schemaVersion, fetchedAt, failedAt, windows}`) for other tools such as `gated-delivery`.
+
+### Changed
+
+- A cache without `schemaVersion: 1` (written by an older guard, or an unknown future shape)
+  is treated as a miss and refetched once — never a crash, never a block from the old data.
+- A malformed or already-reset **per-model** window is dropped on its own; a malformed
+  classic window still rejects the whole cache/response, as before. Keys outside the grammar
+  are still ignored.
+
 ## [0.6.0] - 2026-06-30
 
 ### Fixed

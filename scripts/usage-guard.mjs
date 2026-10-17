@@ -11,7 +11,8 @@
 //    poisoned env cannot redirect the bearer token to an attacker host.
 //  - Cached JSON is validated against a strict allowlist on read. Nothing from
 //    the cache is ever echoed verbatim; all output is rebuilt from validated
-//    numbers and freshly re-formatted parsed Dates.
+//    numbers, freshly re-formatted parsed Dates, and window labels derived
+//    from keys that passed the strict [a-z0-9_] key grammar (v0.7.0).
 //  - Every unexpected error => exit 0 with empty output (fail-soft / fail-open).
 //    Caught error objects are discarded, never stringified into output.
 //  - PreToolUse hook contract amendment (v0.3.0): the ScheduleWakeup-exempt
@@ -126,13 +127,43 @@ const CREDS_BASENAME = '.credentials.json';
 const ONBOARD_BASENAME = 'usage-guard-onboarded';
 const PAUSE_BASENAME = 'usage-guard-pause.json';
 
-// Window keys we understand, mapped to display labels.
+// Window keys we have always understood, mapped to display labels. Since
+// v0.7.0 (issue #10) this is NOT the accepted key set — any key matching
+// WINDOW_KEY_RE is accepted (e.g. `seven_day_fable`). The known keys keep two
+// privileges: a present-but-malformed known entry still rejects the whole
+// cache/response (strict, unchanged), and they are kept first when the
+// MAX_WINDOWS bound is applied.
 const WINDOW_LABELS = {
   five_hour: '5h',
   seven_day: '7d',
   seven_day_opus: '7d-opus',
   seven_day_sonnet: '7d-sonnet',
 };
+
+// Strict grammar for a window key: a known window-class prefix plus an optional
+// suffix of lowercase-alphanumeric segments joined by single underscores. The
+// charset is deliberately narrow — the derived label is echoed into the status
+// line and block message, so nothing outside [a-z0-9_] (no token-like or markup
+// characters) may ever reach output. Length is capped before the regex runs.
+const WINDOW_KEY_RE = /^(five_hour|seven_day)(?:_([a-z0-9]+(?:_[a-z0-9]+)*))?$/;
+const WINDOW_KEY_MAX_LEN = 48;
+const WINDOW_CLASS_LABEL = { five_hour: '5h', seven_day: '7d' };
+
+/**
+ * Upper bound on accepted windows (cache and API response), so a poisoned
+ * payload cannot bloat the cache file or the status line. Known windows are
+ * kept first; the rest are taken in sorted key order.
+ */
+export const MAX_WINDOWS = 16;
+
+/**
+ * Version of the on-disk cache shape
+ *   { schemaVersion, fetchedAt, failedAt, windows: { <key>: { utilization, resets_at } } }
+ * The cache is a documented read-only contract for other tools (README). A cache
+ * without exactly this version is treated as a miss (refetch). Bump on any
+ * incompatible shape change.
+ */
+export const CACHE_SCHEMA_VERSION = 1;
 
 // Allowed debug event codes (allowlist). Anything else is dropped.
 const DEBUG_EVENTS = new Set([
@@ -306,9 +337,47 @@ function validateWindowEntry(entry) {
 }
 
 /**
+ * Display label for a window key, or null when the key is outside the strict
+ * grammar (such keys are dropped). Known keys keep their historical labels;
+ * others derive one from the class prefix and the suffix, underscores mapped to
+ * hyphens: `seven_day_fable` -> `7d-fable`, `five_hour_x` -> `5h-x`. The
+ * mapping is injective (suffixes never contain hyphens), so labels are unique.
+ * Derived `7d-*` labels get the weekly thresholds via isWeeklyLabel.
+ */
+export function windowLabelForKey(key) {
+  if (typeof key !== 'string' || key.length > WINDOW_KEY_MAX_LEN) return null;
+  const m = WINDOW_KEY_RE.exec(key);
+  if (!m) return null;
+  const base = WINDOW_CLASS_LABEL[m[1]];
+  return m[2] === undefined ? base : `${base}-${m[2].replace(/_/g, '-')}`;
+}
+
+/**
+ * The grammar-valid own keys of a windows object in deterministic priority
+ * order: known keys first (WINDOW_LABELS order), then the rest sorted. Callers
+ * apply the MAX_WINDOWS bound over this order, so known windows always survive.
+ */
+function orderedWindowKeys(windows) {
+  const known = [];
+  const extra = [];
+  for (const key of Object.keys(WINDOW_LABELS)) {
+    if (Object.prototype.hasOwnProperty.call(windows, key)) known.push(key);
+  }
+  for (const key of Object.keys(windows)) {
+    if (Object.prototype.hasOwnProperty.call(WINDOW_LABELS, key)) continue;
+    if (windowLabelForKey(key) !== null) extra.push(key);
+  }
+  extra.sort();
+  return known.concat(extra);
+}
+
+/**
  * Strict allowlist validator for the cache object. ANY deviation (wrong shape,
  * non-finite numbers, unparseable dates, unknown windows are simply dropped)
  * that leaves us without a usable structure => return null (treat as miss).
+ * Window keys must match the strict key grammar (windowLabelForKey) and at most
+ * MAX_WINDOWS are kept. The `schemaVersion` gate lives in readCache, because
+ * this validator also runs on API responses, which carry no version.
  *
  * When `nowMs` is provided, timestamps from the future are distrusted and
  * treated as absent: a poisoned `fetchedAt` could otherwise pin the cache
@@ -340,12 +409,26 @@ export function validateCache(raw, nowMs) {
   const cleanWindows = {};
   if (raw.windows !== undefined) {
     if (!isPlainObject(raw.windows)) return null;
-    for (const key of Object.keys(WINDOW_LABELS)) {
+    const hasNow = typeof nowMs === 'number' && Number.isFinite(nowMs);
+    let accepted = 0;
+    for (const key of orderedWindowKeys(raw.windows)) {
+      if (accepted >= MAX_WINDOWS) break;
       const w = raw.windows[key];
       if (w === undefined || w === null) continue;
+      const known = Object.prototype.hasOwnProperty.call(WINDOW_LABELS, key);
       const cleaned = validateWindowEntry(w);
-      if (cleaned === null) return null; // present-but-malformed => whole cache invalid
+      if (cleaned === null) {
+        // Known window present-but-malformed => whole cache invalid (strict,
+        // unchanged). An unknown per-model window may have a shape we do not
+        // understand yet: drop only that entry rather than lose every window.
+        if (known) return null;
+        continue;
+      }
+      // An unknown window whose reset already passed is stale by definition:
+      // drop it here. (Known ones are kept as before; parseWindows drops them.)
+      if (!known && hasNow && Date.parse(cleaned.resets_at) <= nowMs) continue;
       cleanWindows[key] = cleaned;
+      accepted++;
     }
   }
 
@@ -429,7 +512,9 @@ export function parseWindows(data, now) {
   const out = [];
   if (!data || !isPlainObject(data.windows)) return out;
   const nowMs = now instanceof Date ? now.getTime() : null;
-  for (const [key, label] of Object.entries(WINDOW_LABELS)) {
+  for (const key of orderedWindowKeys(data.windows)) {
+    if (out.length >= MAX_WINDOWS) break;
+    const label = windowLabelForKey(key);
     const w = data.windows[key];
     if (!w) continue;
     const util = Math.round(w.utilization);
@@ -999,6 +1084,11 @@ async function readCache(deps) {
     const cachePath = joinPath(claudeDir(deps.homedir), CACHE_BASENAME);
     const text = await deps.fs.readFile(cachePath, 'utf8');
     const parsed = JSON.parse(text);
+    // Versioned contract: a cache without the current schemaVersion (written by
+    // an older guard, or an unknown future shape) is a miss => refetch.
+    if (!isPlainObject(parsed) || parsed.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      return null;
+    }
     return validateCache(parsed, deps.now().getTime());
   } catch {
     return null;
@@ -1018,7 +1108,13 @@ async function writeCache(deps, clean, log) {
     // concurrently in separate processes within the same millisecond.
     const pid = typeof deps.pid === 'number' ? deps.pid : 0;
     tmpPath = joinPath(dir, `${CACHE_BASENAME}.${pid}.${deps.now().getTime()}.tmp`);
-    const payload = JSON.stringify(clean);
+    // Explicit field list = the documented read-only contract (README).
+    const payload = JSON.stringify({
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      fetchedAt: clean.fetchedAt,
+      failedAt: clean.failedAt,
+      windows: clean.windows,
+    });
     await deps.fs.writeFile(tmpPath, payload, { mode: 0o600 });
     await deps.fs.rename(tmpPath, cachePath);
   } catch {
@@ -1156,9 +1252,10 @@ async function fetchUsage(deps, tokenHolder, log) {
  */
 function serializeUsageResponse(body, now) {
   if (!isPlainObject(body)) return null;
-  // validateCache is the single source of truth: it allowlists known window
-  // keys, validates each present entry (rejecting the whole response on any
-  // malformed present window), and ignores unknown keys.
+  // validateCache is the single source of truth: it accepts only keys in the
+  // strict window-key grammar, validates each present entry (rejecting the
+  // whole response on a malformed KNOWN window, dropping a malformed or expired
+  // unknown one), bounds the count at MAX_WINDOWS, and ignores other keys.
   const nowMs = now.getTime();
   return validateCache({ fetchedAt: nowMs, failedAt: null, windows: body }, nowMs);
 }
