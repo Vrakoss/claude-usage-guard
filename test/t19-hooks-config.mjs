@@ -41,6 +41,12 @@ const EXEC_ARGS = ['${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs'];
 const HOOK_KEYS = ['args', 'command', 'timeout', 'type'];
 const FORBIDDEN_KEYS = ['shell', 'async', 'asyncRewake', 'if', 'onFailure'];
 const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
+// A shell-form hook command: `node` followed by the script in one string (any or
+// no quoting, JSON-escaped quotes included), or the script itself as `command`.
+const SHELL_FORM_PATTERNS = [
+  /\bnode\s+\\?["']?\$\{CLAUDE_PLUGIN_ROOT\}/,
+  /"command"\s*:\s*"(?:node\s|\$\{CLAUDE_PLUGIN_ROOT\})/,
+];
 
 // Copy of the documented matcher classification (code.claude.com/docs/en/hooks):
 // "*" / "" / omitted -> match all; only [A-Za-z0-9_\- ,|] -> exact name or a list
@@ -104,10 +110,9 @@ describe('T19 hooks.json — event wiring', () => {
       assert.deepEqual(Object.keys(hook).sort(), HOOK_KEYS, `${event} hook keys`);
     });
 
-    it(`T19.15 ${event}: a bare executable plus one unquoted script path that exists`, () => {
+    it(`T19.15 ${event}: one unquoted script path that exists`, () => {
       const { hook } = soleHook(event);
-      // Exec form spawns `command` as one executable name: no spaces, no quotes.
-      assert.match(hook.command, /^[A-Za-z0-9_.-]+$/);
+      // `command` itself is pinned to exactly 'node' by T19.2.
       assert.ok(Array.isArray(hook.args) && hook.args.length === 1);
       // Each args element is passed verbatim (no shell), so quotes would be literal.
       assert.doesNotMatch(hook.args[0], /["'\s]/);
@@ -236,12 +241,47 @@ describe('T19 docs agree with the exec-form wiring (issue #14)', () => {
     assert.match(install, /guard is \*\*OFF\*\*/);
   });
 
-  it('T19.18 README and CLAUDE.md no longer describe the hooks as shell form', () => {
+  it('T19.18 README and CLAUDE.md contain no shell-form hook command string', () => {
     for (const name of ['README.md', 'CLAUDE.md']) {
       const text = readDoc(name).replace(/\s+/g, ' ');
-      assert.doesNotMatch(text, /hooks stay in \*\*shell form\*\*/i, name);
-      assert.doesNotMatch(text, /Do not switch to exec form/i, name);
+      for (const re of SHELL_FORM_PATTERNS) assert.doesNotMatch(text, re, name);
     }
     assert.match(readDoc('CLAUDE.md'), /\*\*exec form\*\*/);
+  });
+
+  it('T19.19 the shell-form patterns catch the old wiring and spare exec form (self-check)', () => {
+    const caught = [
+      '"command": "node \\"${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs\\""',
+      'node "${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"',
+      "node '${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs'",
+      'node ${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs',
+      '"command": "${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"',
+      '"command" : "node scripts/usage-guard.mjs"',
+    ];
+    for (const s of caught) {
+      assert.ok(SHELL_FORM_PATTERNS.some((re) => re.test(s)), `${s} must be flagged`);
+    }
+    const spared = [
+      '"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"]',
+      'runs the installed `scripts/usage-guard.mjs` with `node`',
+      'On Windows, shell form would start a Git Bash process first',
+    ];
+    for (const s of spared) {
+      assert.ok(!SHELL_FORM_PATTERNS.some((re) => re.test(s)), `${s} must pass`);
+    }
+  });
+
+  it('T19.20 README install section warns that a .cmd/.bat node shim leaves the guard off', () => {
+    // The note sits in the same paragraph as the Node >= 18 requirement.
+    const para = readDoc('README.md')
+      .split(/\r?\n\s*\r?\n/)
+      .map((p) => p.replace(/\s+/g, ' '))
+      .find((p) => /Node\.js \*\*≥ 18\*\*/.test(p));
+    assert.ok(para, 'README states the Node.js >= 18 requirement');
+    assert.match(para, /`node\.exe`/);
+    assert.match(para, /`\.cmd`/);
+    assert.match(para, /`\.bat`/);
+    assert.match(para, /non-blocking/);
+    assert.match(para, /guard is \*\*OFF\*\*/);
   });
 });

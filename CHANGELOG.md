@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-10-17
+
+Follow-ups from the review of 0.10.0 (issue #14), tracked in issue #18. No change to the
+guard's behavior or to `hooks/hooks.json`.
+
+### Added
+
+- **The hook-form timing harness is in the repo:** `scripts/bench-hook-forms.mjs`. It is
+  the tool behind the shell-form vs exec-form medians in the 0.10.0 entry and the README
+  "Hook form" section. Run `node scripts/bench-hook-forms.mjs [runs] [--no-shell]`; the
+  header comment documents the options. It is dev tooling only: never wired into the
+  hooks, zero dependencies, no machine-specific paths. Every spawned guard runs against a
+  throwaway home holding a seeded fresh cache, so it never reads a login token or calls the
+  network. Before timing, a seed probe runs each guard form once against a seed at 100%
+  and requires a block (exit 2): only a guard that answers from the seeded cache can
+  block, so a cache miss (for example after a cache schema drift) aborts the run before
+  any timing. The harness also aborts if a timed call exits non-zero, prints to stdout or
+  touches that home. A re-run in this release (Windows 11, Node 22, 20 interleaved runs,
+  cache hit) gave medians of 121.7 ms through Git Bash, 73.6 ms in exec form and 54.0 ms
+  for a bare `node -e 0`, in line with the 0.10.0 figures.
+
+### Documentation
+
+- README "Install": on Windows, `node` on PATH must resolve to a real `node.exe`. Exec form
+  cannot spawn a `.cmd` or `.bat` shim, so a shim-only setup gets a non-blocking hook error
+  and the guard is off. Documented as a residual, not a safety feature.
+- CHANGELOG: prose lines reflowed to the 92-column wrap target (whitespace only).
+
+### Tests
+
+- `test/t23-bench-harness.mjs` (new): the harness exists with a usage header, imports Node
+  built-ins only, carries no machine-specific paths, never names fetch, a network module or
+  the credentials file, is not wired into the hooks, and runs nothing on import. Its seeded
+  cache and its probe seed are checked against the guard's own `validateCache` and
+  thresholds. One end-to-end case runs a real exec-form round with a hard-blocking cache in
+  the outer home: the run only passes if the harness isolates the home. Another runs the
+  harness against a guard copy with a drifted cache schema: the seed probe must abort the
+  run before it prints any timing. A third runs it against a guard copy that writes a stray
+  file into its home on every call: the home check must abort the run before any timing.
+- `test/t19-hooks-config.mjs`: T19.18 now rejects any shell-form hook command string in
+  README.md and CLAUDE.md (such as `node "${CLAUDE_PLUGIN_ROOT}/…"` or the script as
+  `command`) instead of two exact removed sentences, with a self-check (T19.19). T19.15
+  drops its command regex, which T19.2 (`command === 'node'`) already covers. New T19.20
+  pins the Windows shim note.
+- `test/t20-docs-privacy.mjs`: a tool-call count whose thousands are grouped with dots or
+  spaces (plain, no-break or thin) is now flagged too, not only one grouped with commas.
+- `test/t21-readme-line-width.mjs`: CHANGELOG.md prose is held to the same 92-column limit
+  as the README.
+
 ## [0.10.0] - 2026-10-17
 
 ### Changed
@@ -16,11 +65,11 @@ All notable changes to this project are documented here. The format is based on
   medians of 20 interleaved runs in two sessions: about 125 ms through Git Bash vs 70–77 ms
   in exec form, roughly 50 ms less per gated tool call. The `PreToolUse` denylist matcher
   is unchanged.
-- **Breaking: requires Claude Code ≥ 2.1.139**, the release that added the hook `args` field. An
-  older client drops `args` without an error and runs a bare `node`, which reads the hook
-  payload as a script, exits 1 and shows a non-blocking hook error. The guard is then off.
-  A plugin cannot declare a minimum client version that Claude Code enforces, so this is a
-  documented residual (README "Install"), not a safety guarantee.
+- **Breaking: requires Claude Code ≥ 2.1.139**, the release that added the hook `args`
+  field. An older client drops `args` without an error and runs a bare `node`, which reads
+  the hook payload as a script, exits 1 and shows a non-blocking hook error. The guard is
+  then off. A plugin cannot declare a minimum client version that Claude Code enforces, so
+  this is a documented residual (README "Install"), not a safety guarantee.
 
 ### Tests
 
@@ -43,7 +92,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [0.9.0] - 2026-10-17
 
-Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked in issue #13.
+Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked in
+issue #13.
 
 ### Changed
 
@@ -96,8 +146,8 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
   `SubagentHandback` and `StructuredOutput`. Everything else stays gated, including
   `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one developer's measured
   workload the ten ungated tools together were ~9% of tool calls (the read-only/local subset
-  ~5%), so ~9% of hook spawns are skipped, each one a Git Bash + Node pair costing ~165 ms on
-  Windows.
+  ~5%), so ~9% of hook spawns are skipped, each one a Git Bash + Node pair costing ~165 ms
+  on Windows.
 - README documents the gated set and its trade-offs: ungated tools can keep running past
   HARD until the next gated call, and the matcher relies on Claude Code's documented
   JavaScript-RegExp matcher semantics.
@@ -107,12 +157,12 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
 - **A hard-blocked sub-agent can now return its resume brief.** The block message tells a
   sub-agent to hand a resume brief back to its caller, but with matcher `*` the hand-back
   tool (`SubagentHandback`, or `StructuredOutput` for workflow agents) was blocked too, so
-  the brief was lost. Both are now ungated, and so is `TaskStop`, so a paused model can still
-  halt background work.
-- **Block messages no longer claim every tool is gated.** The sub-agent HARD message now says
-  work tools are gated but the hand-back tools (`SubagentHandback`, `StructuredOutput`) are
-  not, and tells the sub-agent to use one to return its brief. The names come from the new
-  exported `HANDBACK_TOOLS` constant, and `test/t19-hooks-config.mjs` checks each one is
+  the brief was lost. Both are now ungated, and so is `TaskStop`, so a paused model can
+  still halt background work.
+- **Block messages no longer claim every tool is gated.** The sub-agent HARD message now
+  says work tools are gated but the hand-back tools (`SubagentHandback`, `StructuredOutput`)
+  are not, and tells the sub-agent to use one to return its brief. The names come from the
+  new exported `HANDBACK_TOOLS` constant, and `test/t19-hooks-config.mjs` checks each one is
   ungated by the matcher. The resume-hop suffix's "All other tools are gated" line was
   reworded the same way.
 
@@ -141,7 +191,8 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
   bloat the cache file or the status line.
 - **Versioned cache schema.** `~/.claude/usage-guard-cache.json` now carries
   `schemaVersion: 1` and is documented in the README as a stable read-only contract
-  (`{schemaVersion, fetchedAt, failedAt, windows}`) for other tools such as `gated-delivery`.
+  (`{schemaVersion, fetchedAt, failedAt, windows}`) for other tools such as
+  `gated-delivery`.
 
 ### Changed
 
@@ -168,44 +219,45 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
 
 - **Quota-pause no longer enters a degenerate re-hop loop (issue #5).** While hard-blocked,
   Claude Code's `/goal` feature (a prompt-based `Stop` hook) re-drives the agent every turn.
-  Each re-drive the agent re-scheduled a wakeup — stacking dozens — and sometimes ran a shell
-  command to "check the reset", so usage *climbed while paused* (the guard burned the very
-  quota it exists to conserve).
+  Each re-drive the agent re-scheduled a wakeup — stacking dozens — and sometimes ran a
+  shell command to "check the reset", so usage *climbed while paused* (the guard burned the
+  very quota it exists to conserve).
 
   A small pause-state file `~/.claude/usage-guard-pause.json` (numbers only —
   `{ resetAtMs, nextWakeupAtMs }`, strict allowlist via `validatePauseState`, atomic `0o600`
   write, fully fail-open) now records that a wakeup is already pending. It is written
   authoritatively on the `ScheduleWakeup` path (the one place the guard knows a wakeup was
-  scheduled) and read on the two non-resume hard-block paths: if a wakeup is still pending the
-  guard emits a **WAIT** instruction ("a wakeup is already pending — do NOT schedule another,
-  do NOT probe usage, end the turn") instead of inviting yet another schedule. The block/hop
-  messages are now **goal-aware** and explicitly forbid shell/tool probes (the reset time is
-  already in the message). The reset boundary is latched once per pause and the existing
-  `+120s` buffer keeps the resume wakeup landing *after* reset.
+  scheduled) and read on the two non-resume hard-block paths: if a wakeup is still pending
+  the guard emits a **WAIT** instruction ("a wakeup is already pending — do NOT schedule
+  another, do NOT probe usage, end the turn") instead of inviting yet another schedule. The
+  block/hop messages are now **goal-aware** and explicitly forbid shell/tool probes (the
+  reset time is already in the message). The reset boundary is latched once per pause and
+  the existing `+120s` buffer keeps the resume wakeup landing *after* reset.
 
   A hook **cannot** make the agent genuinely idle while `/goal` is active — a `Stop` hook
   cannot veto another hook's forced continuation ("any block wins"), and blocking would only
-  force more continuations. So the guard does **not** add a `Stop` hook; it minimizes the cost
-  of each forced re-drive (one wakeup pending, zero probes) until `/goal`'s own no-progress cap
-  yields.
+  force more continuations. So the guard does **not** add a `Stop` hook; it minimizes the
+  cost of each forced re-drive (one wakeup pending, zero probes) until `/goal`'s own
+  no-progress cap yields.
 
   Invariants preserved (test-enforced): the `RESUME_MARKER` resume-hop path is carved OUT of
   the latch — a fired hop is proof the wakeup fired, so it always re-evaluates fresh and is
   never strangled by a buffer-early WAIT (no stuck state). Fail-open is **asymmetric**: any
-  doubt (torn read, validation failure, poisoned far-future timestamp) → SCHEDULE, never WAIT,
-  so a corrupt/poisoned pause file can never silently disable blocking. The pause file holds
-  only two numbers and never the token; the `ScheduleWakeup` path still never exits 2 and a
-  pause-write failure can never trap it.
+  doubt (torn read, validation failure, poisoned far-future timestamp) → SCHEDULE, never
+  WAIT, so a corrupt/poisoned pause file can never silently disable blocking. The pause file
+  holds only two numbers and never the token; the `ScheduleWakeup` path still never exits 2
+  and a pause-write failure can never trap it.
 
 ### Added
 
 - **Separate weekly thresholds (`CLAUDE_USAGE_GUARD_WEEKLY_WARN` / `_WEEKLY_HARD`, defaults
   90/95).** The `7d`, `7d-opus`, and `7d-sonnet` windows now take their own WARN/HARD so a
   slowly filling weekly window no longer winds the agent down at the same low bar as the
-  volatile 5h window (which keeps the base `CLAUDE_USAGE_GUARD_WARN`/`_HARD`). `evaluateThresholds`
-  scores each window against *its* window-class thresholds and reports the most severe (which
-  is not necessarily the highest-utilization window). The weekly pair is validated and reset
-  independently (clamp `1..100`; `weeklyWarn >= weeklyHard` resets the pair to 90/95).
+  volatile 5h window (which keeps the base `CLAUDE_USAGE_GUARD_WARN`/`_HARD`).
+  `evaluateThresholds` scores each window against *its* window-class thresholds and reports
+  the most severe (which is not necessarily the highest-utilization window). The weekly pair
+  is validated and reset independently (clamp `1..100`; `weeklyWarn >= weeklyHard` resets
+  the pair to 90/95).
 
 ## [0.5.0] - 2026-06-17
 

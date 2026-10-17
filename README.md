@@ -102,8 +102,12 @@ All three hooks use **exec form**: `"command": "node"` with
 directly, with no shell in between. On Windows, shell form would start a Git Bash process
 first and then Node from it. Measured on Windows 11 with Node 22 (PreToolUse payload,
 medians of 20 interleaved runs, two sessions), the guard took about 125 ms through Git
-Bash and 70–77 ms in exec form, so each gated tool call is roughly 50 ms faster. Exec
-form needs Claude Code 2.1.139 or newer (see [Install](#install)).
+Bash and 70–77 ms in exec form, so each gated tool call is roughly 50 ms faster. The
+figures come from the dev-only harness `scripts/bench-hook-forms.mjs`; run
+`node scripts/bench-hook-forms.mjs 20` to measure your own machine (`--no-shell` skips the
+bash form). It runs the guard against a throwaway home with a seeded cache, so it never
+reads your login or calls the network. Exec form needs Claude Code 2.1.139 or newer (see
+[Install](#install)).
 
 ### Gate-and-self-sleep pause design
 
@@ -158,7 +162,10 @@ relaunched fresh after reset with full context.
 
 The first command registers this repo as a plugin marketplace; the second installs the
 `usage-guard` plugin from it. Requires Node.js **≥ 18** on your PATH (Claude Code already
-needs Node, so this is normally satisfied).
+needs Node, so this is normally satisfied). On Windows, `node` on PATH must resolve to a
+real `node.exe`: exec form cannot spawn a `.cmd` or `.bat` shim (as some Node version
+managers install), so a shim-only setup gets a non-blocking hook error and the guard is
+**OFF**. This is a residual risk, not a safety feature.
 
 **Older clients (residual risk, not a safety feature).** Claude Code before 2.1.139 does
 not know the `args` key and drops it without an error, so each hook runs a bare `node`
