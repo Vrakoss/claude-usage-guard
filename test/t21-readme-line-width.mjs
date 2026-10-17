@@ -1,13 +1,14 @@
 /**
- * T21 — README prose stays hard-wrapped (issue #13, criterion 5)
+ * T21 — README and CHANGELOG prose stays hard-wrapped (issue #13, criterion 5;
+ * CHANGELOG added in issue #18)
  *
- * README prose is hard-wrapped at about 92 columns. An edit that rewrites a
+ * README and CHANGELOG prose is hard-wrapped at 92 columns. An edit that rewrites a
  * paragraph as one long line (as happened twice in "Why these ten") is easy to
  * miss in review, so this test fails on any prose line over MAX_PROSE_WIDTH.
  * Lines that cannot be wrapped are exempt: fenced code blocks, table rows
  * (`|` ...) and image lines (`![`...).
  *
- * Pure: reads README.md only, so it runs in every CI cell.
+ * Pure: reads README.md and CHANGELOG.md only, so it runs in every CI cell.
  */
 
 import { describe, it } from 'node:test';
@@ -33,7 +34,7 @@ export function overlongProseLines(text, max = MAX_PROSE_WIDTH) {
   return hits;
 }
 
-describe('T21 README prose stays hard-wrapped', () => {
+describe('T21 README and CHANGELOG prose stays hard-wrapped', () => {
   it('T21.1 no README prose line is wider than MAX_PROSE_WIDTH', () => {
     const readme = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
     assert.deepEqual(overlongProseLines(readme), []);
@@ -60,5 +61,10 @@ describe('T21 README prose stays hard-wrapped', () => {
     assert.deepEqual(overlongProseLines(['y'.repeat(92), 'z'.repeat(93)].join('\n')), [
       'line 2 (width 93)',
     ]);
+  });
+
+  it('T21.4 no CHANGELOG prose line is wider than MAX_PROSE_WIDTH (issue #18)', () => {
+    const log = readFileSync(fileURLToPath(new URL('../CHANGELOG.md', import.meta.url)), 'utf8');
+    assert.deepEqual(overlongProseLines(log), []);
   });
 });

@@ -17,10 +17,11 @@ import { fileURLToPath } from 'node:url';
 
 const DOCS = ['README.md', 'CHANGELOG.md', 'CLAUDE.md'];
 // A personal volume is a count with a k/M suffix ("215k", "1.2M") or a plain
-// number of at least 1000 ("1000", "12,500"). Small counts ("the first 2 tool
+// number of at least 1000 ("1000", "12,500", and the other thousands separators:
+// "12.500", "12 500" with a plain, no-break or thin space). Small counts ("the first 2 tool
 // calls") are ordinary prose, not usage volume, and must not trip the check.
 const CALL_COUNT =
-  /\b(?:\d[\d,.]*\s*[kKmM]|[1-9]\d{3,}|[1-9]\d{0,2}(?:,\d{3})+)[\s-]+(?:tool[\s-]+)?calls?\b/;
+  /\b(?:\d[\d,.]*\s*[kKmM]|[1-9]\d{3,}|[1-9]\d{0,2}(?:[,.    ]\d{3})+)[\s-]+(?:tool[\s-]+)?calls?\b/;
 const USAGE_WINDOW =
   /\b(?:last|past)\s+\d+\s+(?:days|weeks|months)\b|\b\d+\s+(?:days|weeks|months)\s+of\s+(?:usage|history|sessions|transcripts)\b/i;
 
@@ -73,6 +74,23 @@ describe('T20 public docs carry no personal usage volume', () => {
     for (const small of [
       'the first 2 tool calls', '999 calls', 'after 10 calls', 'one or 2 calls',
       'an extra 0999 calls', '2 more calls',
+    ]) {
+      assert.ok(!CALL_COUNT.test(small), `${small} must pass`);
+    }
+  });
+
+  it('T20.6 thousands grouped with dots or spaces trip the check too (issue #18)', () => {
+    for (const big of [
+      '12.500 calls', '12 500 calls', '12.500-call run', '1.000 tool calls',
+      '12 500 calls', '12 500 tool calls', '12 500 calls', '1 234 567 calls',
+    ]) {
+      assert.ok(CALL_COUNT.test(big), `${JSON.stringify(big)} must be flagged`);
+    }
+  });
+
+  it('T20.7 decimals and short digit groups still pass', () => {
+    for (const small of [
+      '1.5 calls', 'section 2.10 calls', '0.500 calls', '12 50 calls', '999 calls',
     ]) {
       assert.ok(!CALL_COUNT.test(small), `${small} must pass`);
     }
