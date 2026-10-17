@@ -53,6 +53,10 @@
 //    TaskOutput, TaskStop, SubagentHandback, StructuredOutput) via a JS-RegExp
 //    negative lookahead, so those tools never spawn this script. Unknown and
 //    future tools, every mcp__* tool and ScheduleWakeup stay matched.
+//  - Every hook runs in exec form (v0.10.0, issue #14): Claude Code spawns
+//    `node <this script>` directly, with no shell. That needs Claude Code
+//    >= 2.1.139; an older client drops `args`, runs a bare `node`, which exits 1
+//    on the hook JSON (non-blocking), so the guard is off there (README residual).
 //
 // PAUSE LATCH (v0.6.0): a degenerate re-hop loop was reported (issue #5) — while
 // hard-blocked, Claude Code's /goal feature (a prompt-based Stop hook) re-drives
@@ -165,10 +169,10 @@ export const MAX_WINDOWS = 16;
  * Upper bound on keys EXAMINED per windows object (issue #13), so the
  * poisoned-payload bound holds for CPU as well as size: at most this many keys
  * (in Object.keys order: integer-like keys first, then insertion order) are
- * grammar-checked and sorted, instead of every key
- * before MAX_WINDOWS is applied. Known windows are looked up directly and are
- * never subject to it. The real endpoint returns ~a dozen top-level keys, so
- * 16 x MAX_WINDOWS is far above anything legitimate.
+ * grammar-checked and sorted, instead of every key before MAX_WINDOWS is
+ * applied. Known windows are looked up directly and are never subject to it.
+ * The real endpoint returns ~a dozen top-level keys, so 16 x MAX_WINDOWS is far
+ * above anything legitimate.
  */
 export const MAX_WINDOW_KEY_SCAN = 16 * MAX_WINDOWS;
 

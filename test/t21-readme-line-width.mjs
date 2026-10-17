@@ -15,9 +15,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-// The wrap target is 92; a few existing lines end with a short code span that
-// would look worse broken, so allow a small margin over it.
-const MAX_PROSE_WIDTH = 95;
+// The limit is the wrap target itself (issue #14): no slack over 92.
+export const MAX_PROSE_WIDTH = 92;
 
 /** Returns "line N (width W)" for every non-exempt prose line wider than `max`. */
 export function overlongProseLines(text, max = MAX_PROSE_WIDTH) {
@@ -54,5 +53,12 @@ describe('T21 README prose stays hard-wrapped', () => {
       `![${long}](a.png)`,
     ].join('\n');
     assert.deepEqual(overlongProseLines(sample), ['line 2 (width 138)']);
+  });
+
+  it('T21.3 the limit equals the 92-column wrap target (93 fails, 92 passes)', () => {
+    assert.equal(MAX_PROSE_WIDTH, 92);
+    assert.deepEqual(overlongProseLines(['y'.repeat(92), 'z'.repeat(93)].join('\n')), [
+      'line 2 (width 93)',
+    ]);
   });
 });

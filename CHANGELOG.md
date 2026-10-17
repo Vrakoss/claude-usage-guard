@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-17
+
+### Changed
+
+- **Hooks run in exec form (issue #14).** All three hooks (`UserPromptSubmit`,
+  `PreToolUse`, `SessionStart`) now use `"command": "node"` with
+  `"args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"]` instead of the shell-form
+  command string. Claude Code spawns `node` directly, so Windows no longer starts a Git
+  Bash process for every hook call. Measured on Windows 11, Node 22, PreToolUse payload,
+  medians of 20 interleaved runs in two sessions: about 125 ms through Git Bash vs 70–77 ms
+  in exec form, roughly 50 ms less per gated tool call. The `PreToolUse` denylist matcher
+  is unchanged.
+- **Breaking: requires Claude Code ≥ 2.1.139**, the release that added the hook `args` field. An
+  older client drops `args` without an error and runs a bare `node`, which reads the hook
+  payload as a script, exits 1 and shows a non-blocking hook error. The guard is then off.
+  A plugin cannot declare a minimum client version that Claude Code enforces, so this is a
+  documented residual (README "Install"), not a safety guarantee.
+
+### Tests
+
+- `test/t19-hooks-config.mjs` pins exec form: each hook has `command: "node"`, `args` equal
+  to the script path, timeout 20, and no other keys (no `shell`, `async`, `asyncRewake`,
+  `if` or `onFailure`). New cases check that the script path exists in the plugin and that
+  the README install section states the version requirement and the older-client residual.
+- `test/t20-docs-privacy.mjs`: a tool-call count now needs a k/M suffix or a number of at
+  least 1000, so ordinary prose such as "the first 2 tool calls" no longer trips the check.
+  A new case proves small counts pass and large ones are still caught.
+- `test/t21-readme-line-width.mjs`: the README line limit is now the 92-column wrap target
+  itself (it allowed 95). Three README lines were reflowed to fit.
+
+### Documentation
+
+- README: new "Hook form" section and the Claude Code ≥ 2.1.139 requirement in "Install".
+- CLAUDE.md: the hook-wiring bullet describes exec form and the minimum client version.
+- `scripts/usage-guard.mjs`: reflowed the `MAX_WINDOW_KEY_SCAN` JSDoc and noted exec form
+  in the file header. No behavior change.
+
 ## [0.9.0] - 2026-10-17
 
 Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked in issue #13.
