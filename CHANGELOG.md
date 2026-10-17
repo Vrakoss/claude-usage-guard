@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-17
+
+Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked in issue #13.
+
+### Changed
+
+- **Window-key scanning is bounded for CPU, not just size.** `orderedWindowKeys` used to
+  grammar-check and sort every key of a windows object before the `MAX_WINDOWS` (16) bound
+  was applied, so a huge payload cost O(n log n). Now only the first `MAX_WINDOW_KEY_SCAN`
+  (256 = 16 × `MAX_WINDOWS`) keys in payload order are examined. The four classic keys are
+  still looked up directly, so they are never pushed out. A per-model window that appears
+  after the first 256 keys is ignored, which the real endpoint (about a dozen top-level
+  keys) never comes close to. Collecting the key list (`Object.keys`) is still linear, but
+  it costs less than the `JSON.parse` that produced the object. Measured on Windows,
+  Node 22, `validateCache` + `parseWindows` on 200k valid keys went from ~335 ms to ~136 ms
+  (median of 7).
+
+### Tests
+
+- `test/t18-per-model-windows.mjs`: the 48-character key limit now has a boundary test
+  (48 accepted, 49 rejected, directly and through `validateCache`/`parseWindows`), so an
+  off-by-one in the length check fails the suite. New cases pin `MAX_WINDOW_KEY_SCAN`,
+  the keep/ignore edge at the 256th key, classic keys surviving past the budget, and a
+  20k-key payload sorted only within the budget.
+- `test/t19-hooks-config.mjs`: T19.13 now covers both main-thread block branches (reset
+  within 6h, and reset more than 6h out). Each case checks it hit its branch and that no
+  sub-agent hand-back wording appears.
+
+### Documentation
+
+- Added the one-time upgrade note to the 0.7.0 entry: upgrading from 0.6.0 while
+  hard-blocked leaves a short fail-open window until the next prompt refetches.
+- README: reflowed the over-long lines in "Which tools are gated" ("Why these ten") and
+  "Sub-agents abort", and the first trade-off no longer claims, without data, that almost
+  every turn reaches a `Bash`/`Edit` call. It now says the overrun depends on the workload.
+  A new test (`test/t21-readme-line-width.mjs`) fails on any README prose line wider than
+  95 columns (code blocks, table rows and images are exempt).
+- README: the cache validation bullet mentions the 256-key scan budget.
+- README "Why these ten" and the 0.8.0 entry no longer state personal usage volume (a
+  tool-call count and a time window). Only the ~9% and ~5% shares remain. A new test
+  (`test/t20-docs-privacy.mjs`) fails if a usage-volume figure comes back.
+- CLAUDE.md: the test-convention sentence covers `t1`–`t22` and names every test file that
+  does not use `test/helpers.mjs`. A new test (`test/t22-claude-md-test-list.mjs`) fails
+  when a test file is added without updating that sentence.
+
 ## [0.8.0] - 2026-10-17
 
 ### Changed
@@ -12,7 +57,7 @@ All notable changes to this project are documented here. The format is based on
   denylist written as a JavaScript-RegExp negative lookahead. The guard is not spawned for
   `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TodoWrite`, `TaskOutput`, `TaskStop`,
   `SubagentHandback` and `StructuredOutput`. Everything else stays gated, including
-  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one measured 215k-call local
+  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one developer's measured
   workload the ten ungated tools together were ~9% of tool calls (the read-only/local subset
   ~5%), so ~9% of hook spawns are skipped, each one a Git Bash + Node pair costing ~165 ms on
   Windows.
@@ -68,6 +113,17 @@ All notable changes to this project are documented here. The format is based on
 - A malformed or already-reset **per-model** window is dropped on its own; a malformed
   classic window still rejects the whole cache/response, as before. Keys outside the grammar
   are still ignored.
+
+### Upgrade note (added in 0.9.0)
+
+- **One-time fail-open window when upgrading while hard-blocked.** A cache written by 0.6.0
+  has no `schemaVersion`, so 0.7.0 and later treat it as a miss. `PreToolUse` only reads the
+  cache (it never fetches), so until the next `UserPromptSubmit` refetches, the tool gate
+  fails open, and a `ScheduleWakeup` issued in that gap gets no `[usage-guard:resume]`
+  stamp. `SessionStart` does not fetch either, so it does not close the gap. The next
+  prompt refetches and blocks again if the account is still over HARD. This follows the
+  fail-open design: the guard would rather miss a block once than block on data it cannot
+  trust.
 
 ## [0.6.0] - 2026-06-30
 

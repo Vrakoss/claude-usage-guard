@@ -69,24 +69,25 @@ lookahead:
   `mcp__fs__Read` or `ReadX` are still gated.
 - **Why these ten:** the read-only/local tools are cheap and cannot spend real quota on
   their own. Each call used to cost a Git Bash + Node spawn (~165 ms on Windows). On one
-  measured workload (215k tool calls from a single developer's last 60 days) all ten ungated
-  tools together were about 9% of tool calls; the read-only/local subset alone was about 5%,
-  and the hand-back tools `StructuredOutput` and `SubagentHandback` most of the rest. The wind-down tools must stay usable at HARD:
-  a hard-blocked sub-agent is told to return a resume brief to its caller, and with the old
-  `*` matcher the hand-back tool (`SubagentHandback`, or `StructuredOutput` for workflow
-  agents) was itself blocked, so the brief was lost. `TaskStop` lets the model halt
-  background work while paused.
+  developer's measured workload all ten ungated tools together were about 9% of tool
+  calls; the read-only/local subset alone was about 5%, and the hand-back tools
+  `StructuredOutput` and `SubagentHandback` most of the rest. The wind-down tools must stay
+  usable at HARD: a hard-blocked sub-agent is told to return a resume brief to its caller,
+  and with the old `*` matcher the hand-back tool (`SubagentHandback`, or `StructuredOutput`
+  for workflow agents) was itself blocked, so the brief was lost. `TaskStop` lets the model
+  halt background work while paused.
 
 **Trade-offs (residual risks):**
 
 1. **Ungated tools run past HARD.** A run of only ungated tools (for example a burst of
    `Read`/`Grep`) continues until the next gated call or the end of the turn. The next
-   prompt is still blocked by `UserPromptSubmit`. In practice almost every turn reaches a
-   `Bash`/`Edit` call, so the overrun is short. This is **not configurable** from the plugin:
-   a plugin matcher cannot read user settings, and an environment variable cannot bring back
-   a hook call that never happened. If you want strict all-tool gating, add your own
-   `PreToolUse` hook with `"matcher": "*"` to `~/.claude/settings.json` that runs the
-   installed `scripts/usage-guard.mjs` with `node`.
+   prompt is still blocked by `UserPromptSubmit`. How long the overrun lasts depends on the
+   workload: it ends at the first gated call (such as `Bash` or `Edit`), so it can be short,
+   but a long read-only stretch can run to the end of the turn. This is **not configurable**
+   from the plugin: a plugin matcher cannot read user settings, and an environment variable
+   cannot bring back a hook call that never happened. If you want strict all-tool gating, add
+   your own `PreToolUse` hook with `"matcher": "*"` to `~/.claude/settings.json` that runs
+   the installed `scripts/usage-guard.mjs` with `node`.
 2. **The matcher relies on Claude Code's JavaScript-RegExp matcher semantics.** Claude Code
    documents that a matcher containing characters other than letters, digits, `_`, `-`,
    spaces, `,` and `|` is an unanchored JavaScript regular expression tested with
@@ -135,10 +136,10 @@ Sub-agents (detected via the `agent_id` field in the `PreToolUse` hook input) ca
 `ScheduleWakeup` — it is only available on the main agent thread. When a sub-agent is
 hard-blocked, the guard instructs it to **abort immediately** and return a resume brief to
 its caller through its hand-back tool (`SubagentHandback`, or `StructuredOutput` for
-workflow agents), which stays ungated for exactly this purpose: current state, remaining steps, and exact relaunch instructions (context, tool
-calls, arguments). The caller embeds this brief in the wakeup prompt
-(after `[usage-guard:resume]`) so the sub-agent can be relaunched fresh after reset with
-full context.
+workflow agents), which stays ungated for exactly this purpose: current state, remaining
+steps, and exact relaunch instructions (context, tool calls, arguments). The caller embeds
+this brief in the wakeup prompt (after `[usage-guard:resume]`) so the sub-agent can be
+relaunched fresh after reset with full context.
 
 ## Install
 
@@ -242,6 +243,8 @@ cannot leak through the usual exfiltration channels:
   or already-reset per-model window is dropped on its own. Window keys must match the strict
   grammar `five_hour|seven_day` + optional `_<a-z0-9 segments>` (max 48 chars), and at most
   16 windows are kept, so a poisoned payload cannot bloat the cache or the status line.
+  Beyond the four classic keys (always looked up directly), only the first 256 keys of a
+  payload are examined, so a huge payload cannot make the key check and sort expensive.
   **Nothing from the cache is ever echoed verbatim** — all output is rebuilt from validated
   numbers, freshly re-formatted parsed dates, and labels derived from the grammar-checked key.
 - **Allowlist debug logging.** Debug mode only ever writes a fixed set of event codes plus

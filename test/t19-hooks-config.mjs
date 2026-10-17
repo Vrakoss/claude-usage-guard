@@ -165,10 +165,25 @@ describe('T19 sub-agent block message agrees with the matcher', () => {
     assert.match(msg, /ScheduleWakeup is NOT available/);
   });
 
-  it('T19.13 main-thread messages are unchanged by the hand-back wording', () => {
-    const main = buildToolBlockMessage(worst, now, false);
-    assert.ok(!main.includes('hand-back'), 'main-thread pause message must not mention hand-back');
-  });
+  // Both main-thread branches: reset within 6h (self-sleep pause) and reset
+  // more than 6h out (wrap-up). Each case first proves it hit its own branch,
+  // then that none of the sub-agent hand-back wording leaked into it.
+  const weekly = { label: '7d', util: 99, reset: new Date(now.getTime() + 3 * 24 * 3600 * 1000) };
+  for (const [name, w, branchMark] of [
+    ['reset within 6h', worst, /call ScheduleWakeup \(exempt from this gate\)/],
+    ['reset more than 6h out', weekly, /Wrap up: summarize state for the user/],
+  ]) {
+    it(`T19.13 main-thread message (${name}) carries no hand-back wording`, () => {
+      const main = buildToolBlockMessage(w, now, false);
+      assert.match(main, branchMark, 'must exercise the intended main-thread branch');
+      assert.ok(!main.includes('hand-back'), 'main-thread message must not mention hand-back');
+      assert.doesNotMatch(main, /resume brief to your caller/);
+      assert.doesNotMatch(main, /sub-agent:/i);
+      for (const tool of HANDBACK_TOOLS) {
+        assert.ok(!main.includes(tool), `main-thread message must not name ${tool}`);
+      }
+    });
+  }
 
   it('T19.14 resume-hop suffix no longer claims every other tool is gated', () => {
     const suffix = buildResumeHopSuffix(worst, now);

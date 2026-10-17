@@ -20,6 +20,7 @@ import {
   windowLabelForKey,
   CACHE_SCHEMA_VERSION,
   MAX_WINDOWS,
+  MAX_WINDOW_KEY_SCAN,
 } from '../scripts/usage-guard.mjs';
 import {
   makeDeps,
@@ -394,5 +395,100 @@ describe('T18 — token never leaks via the new windows path', () => {
       assert.ok(!String(part).includes(SENTINEL_TOKEN), 'sentinel token leaked');
     }
     assert.ok(r.fakeFs._peek(DEBUG_LOG_PATH) !== undefined, 'debug log was exercised');
+  });
+});
+
+describe('T18 — key-length boundary (issue #13)', () => {
+  // 'seven_day_' is 10 chars; pad the suffix to land exactly on the boundary.
+  const key48 = `seven_day_${'a'.repeat(38)}`;
+  const key49 = `seven_day_${'a'.repeat(39)}`;
+
+  it('T18.20 a 48-char key is accepted and a 49-char key is rejected', () => {
+    assert.equal(key48.length, 48);
+    assert.equal(key49.length, 49);
+    assert.equal(windowLabelForKey(key48), `7d-${'a'.repeat(38)}`);
+    assert.equal(windowLabelForKey(key49), null);
+  });
+
+  it('T18.21 the length boundary holds through validateCache and parseWindows', () => {
+    const windows = {
+      [key48]: { utilization: 5, resets_at: RESET_IN_8H },
+      [key49]: { utilization: 6, resets_at: RESET_IN_8H },
+    };
+    const clean = validateCache({ fetchedAt: FIXED_NOW_MS, failedAt: null, windows }, FIXED_NOW_MS);
+    assert.deepEqual(Object.keys(clean.windows), [key48]);
+    assert.deepEqual(
+      parseWindows({ windows }, NOW).map((w) => w.util),
+      [5],
+    );
+  });
+});
+
+describe('T18 — bounded key scan (issue #13)', () => {
+  /** n own keys outside the window grammar, inserted before anything else. */
+  const junk = (n) => {
+    const o = {};
+    for (let i = 0; i < n; i++) {
+      o[`junk_${String(i).padStart(4, '0')}`] = { utilization: 1, resets_at: RESET_IN_8H };
+    }
+    return o;
+  };
+  const late = { utilization: 7, resets_at: RESET_IN_8H };
+  const validate = (windows) =>
+    validateCache({ fetchedAt: FIXED_NOW_MS, failedAt: null, windows }, FIXED_NOW_MS);
+
+  it('T18.22 MAX_WINDOW_KEY_SCAN is pinned at 16 x MAX_WINDOWS', () => {
+    assert.equal(MAX_WINDOW_KEY_SCAN, 256);
+    assert.equal(MAX_WINDOW_KEY_SCAN, 16 * MAX_WINDOWS);
+  });
+
+  it('T18.23 an extra key inside the scan budget is kept; one past it is not examined', () => {
+    const inside = { ...junk(MAX_WINDOW_KEY_SCAN - 1), seven_day_late: late };
+    const past = { ...junk(MAX_WINDOW_KEY_SCAN), seven_day_late: late };
+    assert.deepEqual(Object.keys(validate(inside).windows), ['seven_day_late']);
+    assert.deepEqual(Object.keys(validate(past).windows), []);
+    assert.deepEqual(parseWindows({ windows: inside }, NOW).map((w) => w.label), ['7d-late']);
+    assert.deepEqual(parseWindows({ windows: past }, NOW), []);
+  });
+
+  it('T18.24 known windows past the scan budget are still kept (looked up directly)', () => {
+    const windows = {
+      ...junk(MAX_WINDOW_KEY_SCAN * 2),
+      five_hour: { utilization: 99, resets_at: RESET_IN_3H },
+      seven_day: { utilization: 20, resets_at: RESET_IN_8H },
+      seven_day_opus: { utilization: 30, resets_at: RESET_IN_8H },
+      seven_day_sonnet: { utilization: 40, resets_at: RESET_IN_8H },
+    };
+    assert.deepEqual(Object.keys(validate(windows).windows), [
+      'five_hour',
+      'seven_day',
+      'seven_day_opus',
+      'seven_day_sonnet',
+    ]);
+    assert.deepEqual(
+      parseWindows({ windows }, NOW).map((w) => w.label),
+      ['5h', '7d', '7d-opus', '7d-sonnet'],
+    );
+  });
+
+  it('T18.25 a huge grammar-valid payload is only sorted within the scan budget', () => {
+    // 20k valid keys inserted in DESCENDING order. A full sort would keep the
+    // global minimum (m000000..); the bounded scan only sorts the first 256 keys
+    // in payload order (m019744..m019999) and keeps the lowest of those.
+    const N = 20_000;
+    const windows = {};
+    for (let i = N - 1; i >= 0; i--) {
+      windows[`seven_day_m${String(i).padStart(6, '0')}`] = { utilization: 1, resets_at: RESET_IN_8H };
+    }
+    const firstScanned = N - MAX_WINDOW_KEY_SCAN;
+    const expected = Array.from(
+      { length: MAX_WINDOWS },
+      (_, i) => `seven_day_m${String(firstScanned + i).padStart(6, '0')}`,
+    );
+    assert.deepEqual(Object.keys(validate(windows).windows), expected);
+    assert.deepEqual(
+      parseWindows({ windows }, NOW).map((w) => w.label),
+      expected.map((k) => k.replace('seven_day_', '7d-')),
+    );
   });
 });
