@@ -68,8 +68,8 @@ lookahead:
   `mcp__*` tool, and any tool Claude Code adds later. Only exact names are exempt:
   `mcp__fs__Read` or `ReadX` are still gated.
 - **Why these ten:** the read-only/local tools are cheap and cannot spend real quota on
-  their own. Each call used to cost a Git Bash + Node spawn (~165 ms on Windows). On one
-  developer's measured workload all ten ungated tools together were about 9% of tool
+  their own, yet each gated call costs a Node process spawn (see [Hook form](#hook-form)).
+  On one developer's measured workload all ten ungated tools together were about 9% of tool
   calls; the read-only/local subset alone was about 5%, and the hand-back tools
   `StructuredOutput` and `SubagentHandback` most of the rest. The wind-down tools must stay
   usable at HARD: a hard-blocked sub-agent is told to return a resume brief to its caller,
@@ -85,9 +85,9 @@ lookahead:
    workload: it ends at the first gated call (such as `Bash` or `Edit`), so it can be short,
    but a long read-only stretch can run to the end of the turn. This is **not configurable**
    from the plugin: a plugin matcher cannot read user settings, and an environment variable
-   cannot bring back a hook call that never happened. If you want strict all-tool gating, add
-   your own `PreToolUse` hook with `"matcher": "*"` to `~/.claude/settings.json` that runs
-   the installed `scripts/usage-guard.mjs` with `node`.
+   cannot bring back a hook call that never happened. If you want strict all-tool gating,
+   add your own `PreToolUse` hook with `"matcher": "*"` to `~/.claude/settings.json` that
+   runs the installed `scripts/usage-guard.mjs` with `node`.
 2. **The matcher relies on Claude Code's JavaScript-RegExp matcher semantics.** Claude Code
    documents that a matcher containing characters other than letters, digits, `_`, `-`,
    spaces, `,` and `|` is an unanchored JavaScript regular expression tested with
@@ -95,11 +95,15 @@ lookahead:
    The test suite (`test/t19-hooks-config.mjs`) pins the matcher contract, but it cannot
    detect a change in Claude Code itself.
 
-The hooks stay in **shell form** (`"command": "node \"${CLAUDE_PLUGIN_ROOT}/…\""`). Exec
-form (`command` + `args`) would skip the Git Bash process on Windows, but Claude Code
-versions before 2.1.139 silently drop the `args` key and would run a bare `node` that reads
-the hook payload as a script. That turns the guard off without telling the user, and a
-plugin cannot require a minimum Claude Code version.
+### Hook form
+
+All three hooks use **exec form**: `"command": "node"` with
+`"args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"]`. Claude Code spawns `node`
+directly, with no shell in between. On Windows, shell form would start a Git Bash process
+first and then Node from it. Measured on Windows 11 with Node 22 (PreToolUse payload,
+medians of 20 interleaved runs, two sessions), the guard took about 125 ms through Git
+Bash and 70–77 ms in exec form, so each gated tool call is roughly 50 ms faster. Exec
+form needs Claude Code 2.1.139 or newer (see [Install](#install)).
 
 ### Gate-and-self-sleep pause design
 
@@ -143,6 +147,10 @@ relaunched fresh after reset with full context.
 
 ## Install
 
+> **Requires Claude Code ≥ 2.1.139.** The hooks use exec form (`command` + `args`), which
+> Claude Code added in 2.1.139. Check your version with `claude --version` before you
+> install.
+
 ```text
 /plugin marketplace add Vrakoss/claude-usage-guard
 /plugin install usage-guard@claude-usage-guard
@@ -151,6 +159,15 @@ relaunched fresh after reset with full context.
 The first command registers this repo as a plugin marketplace; the second installs the
 `usage-guard` plugin from it. Requires Node.js **≥ 18** on your PATH (Claude Code already
 needs Node, so this is normally satisfied).
+
+**Older clients (residual risk, not a safety feature).** Claude Code before 2.1.139 does
+not know the `args` key and drops it without an error, so each hook runs a bare `node`
+with no script. Node then reads the hook payload on stdin as JavaScript, hits a syntax
+error and exits 1. Claude Code treats exit 1 as a non-blocking hook error: you see a hook
+error notice, nothing is warned or blocked, and the guard is **OFF**. The plugin cannot
+prevent this, because a plugin has no way to declare a minimum Claude Code version that
+the client enforces. Update Claude Code first; the Verify step below shows whether the
+guard is running.
 
 **Verify:** start a new session and submit any prompt. A `[usage] 5h: N% …` line
 should appear in context. No line = guard failed open (missing creds / network /
@@ -246,7 +263,8 @@ cannot leak through the usual exfiltration channels:
   Beyond the four classic keys (always looked up directly), only the first 256 keys of a
   payload are examined, so a huge payload cannot make the key check and sort expensive.
   **Nothing from the cache is ever echoed verbatim** — all output is rebuilt from validated
-  numbers, freshly re-formatted parsed dates, and labels derived from the grammar-checked key.
+  numbers, freshly re-formatted parsed dates, and labels derived from the grammar-checked
+  key.
 - **Allowlist debug logging.** Debug mode only ever writes a fixed set of event codes plus
   known-safe primitives (e.g. an HTTP `status` number). It never writes raw errors,
   response bodies, or anything from the credential path. As defense-in-depth, the final
@@ -336,7 +354,8 @@ You can also delete the local artifacts the guard creates:
 
 - `~/.claude/usage-guard-cache.json`
 - `~/.claude/usage-guard-debug.log` (only if you enabled debug mode)
-- `~/.claude/usage-guard-onboarded` (onboarding marker — delete to re-trigger the setup note)
+- `~/.claude/usage-guard-onboarded` (onboarding marker — delete it to re-trigger the
+  setup note)
 
 ## License
 

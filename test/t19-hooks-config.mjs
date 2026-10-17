@@ -8,12 +8,14 @@
  * (SubagentHandback, StructuredOutput) lets a hard-blocked sub-agent actually
  * return the resume brief the block message asks for.
  *
- * Every hook stays in SHELL form (`command` string, no `args`). Exec form
- * (`command` + `args`) only exists from Claude Code 2.1.139; older clients strip
+ * Every hook runs in EXEC form (issue #14): `"command": "node"` plus
+ * `"args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"]`. Claude Code spawns
+ * node directly with no shell, which skips the Git Bash process that shell form
+ * starts on Windows. Exec form needs Claude Code >= 2.1.139: older clients strip
  * the unknown `args` key and run a bare `node` that evaluates the hook JSON on
  * stdin as a script -> SyntaxError, exit 1 -> non-blocking error, i.e. the guard
- * is silently off. Plugins cannot declare an enforced minimum client version, so
- * exec form is not shipped (see the issue #11 supervisor ruling).
+ * is off. The owner ruled such clients out of scope (issue #14); the README
+ * documents it as a residual.
  *
  * The sub-agent HARD block message names the hand-back tools (HANDBACK_TOOLS)
  * as still usable; T19.10-T19.12 tie that message to the matcher so the two
@@ -25,7 +27,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HANDBACK_TOOLS, buildToolBlockMessage, buildResumeHopSuffix } from '../scripts/usage-guard.mjs';
 
@@ -33,8 +36,11 @@ const HOOKS_PATH = fileURLToPath(new URL('../hooks/hooks.json', import.meta.url)
 const config = JSON.parse(readFileSync(HOOKS_PATH, 'utf8'));
 
 const EVENTS = ['UserPromptSubmit', 'PreToolUse', 'SessionStart'];
-const SHELL_COMMAND = 'node "${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs"';
-const FORBIDDEN_KEYS = ['args', 'shell', 'async', 'asyncRewake', 'if', 'onFailure'];
+const EXEC_COMMAND = 'node';
+const EXEC_ARGS = ['${CLAUDE_PLUGIN_ROOT}/scripts/usage-guard.mjs'];
+const HOOK_KEYS = ['args', 'command', 'timeout', 'type'];
+const FORBIDDEN_KEYS = ['shell', 'async', 'asyncRewake', 'if', 'onFailure'];
+const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 // Copy of the documented matcher classification (code.claude.com/docs/en/hooks):
 // "*" / "" / omitted -> match all; only [A-Za-z0-9_\- ,|] -> exact name or a list
@@ -82,18 +88,32 @@ describe('T19 hooks.json — event wiring', () => {
   });
 
   for (const event of EVENTS) {
-    it(`T19.2 ${event}: one shell-form command hook running the guard, timeout 20`, () => {
+    it(`T19.2 ${event}: one exec-form command hook running the guard, timeout 20`, () => {
       const { hook } = soleHook(event);
       assert.equal(hook.type, 'command');
-      assert.equal(hook.command, SHELL_COMMAND);
+      assert.equal(hook.command, EXEC_COMMAND);
+      assert.deepEqual(hook.args, EXEC_ARGS);
       assert.equal(hook.timeout, 20);
     });
 
-    it(`T19.3 ${event}: no args/shell/async/asyncRewake/if/onFailure keys`, () => {
+    it(`T19.3 ${event}: no shell/async/asyncRewake/if/onFailure keys`, () => {
       const { hook } = soleHook(event);
       for (const key of FORBIDDEN_KEYS) {
         assert.equal(Object.hasOwn(hook, key), false, `${event} hook must not set "${key}"`);
       }
+      assert.deepEqual(Object.keys(hook).sort(), HOOK_KEYS, `${event} hook keys`);
+    });
+
+    it(`T19.15 ${event}: a bare executable plus one unquoted script path that exists`, () => {
+      const { hook } = soleHook(event);
+      // Exec form spawns `command` as one executable name: no spaces, no quotes.
+      assert.match(hook.command, /^[A-Za-z0-9_.-]+$/);
+      assert.ok(Array.isArray(hook.args) && hook.args.length === 1);
+      // Each args element is passed verbatim (no shell), so quotes would be literal.
+      assert.doesNotMatch(hook.args[0], /["'\s]/);
+      assert.ok(hook.args[0].startsWith('${CLAUDE_PLUGIN_ROOT}/'));
+      const resolved = join(PLUGIN_ROOT, hook.args[0].slice('${CLAUDE_PLUGIN_ROOT}/'.length));
+      assert.ok(existsSync(resolved), `${resolved} must exist in the plugin`);
     });
   }
 
@@ -189,5 +209,39 @@ describe('T19 sub-agent block message agrees with the matcher', () => {
     const suffix = buildResumeHopSuffix(worst, now);
     assert.doesNotMatch(suffix, /all other tools are gated/i);
     assert.match(suffix, /Work tools \(shell, edits, web, agents, MCP\) stay gated/);
+  });
+});
+
+describe('T19 docs agree with the exec-form wiring (issue #14)', () => {
+  const readDoc = (name) =>
+    readFileSync(fileURLToPath(new URL(`../${name}`, import.meta.url)), 'utf8');
+
+  /** Returns the README text from "## Install" up to the next "## " heading. */
+  function installSection(readme) {
+    const start = readme.indexOf('\n## Install');
+    assert.ok(start >= 0, 'README has an "## Install" section');
+    const end = readme.indexOf('\n## ', start + 1);
+    return readme.slice(start, end < 0 ? undefined : end).replace(/\s+/g, ' ');
+  }
+
+  it('T19.16 README install section states the Claude Code >= 2.1.139 requirement', () => {
+    assert.match(installSection(readDoc('README.md')), /\*\*Requires Claude Code ≥ 2\.1\.139\.?\*\*/);
+  });
+
+  it('T19.17 README install section says an older client leaves the guard OFF', () => {
+    const install = installSection(readDoc('README.md'));
+    assert.match(install, /bare `node`/);
+    assert.match(install, /exits 1/);
+    assert.match(install, /non-blocking hook error/);
+    assert.match(install, /guard is \*\*OFF\*\*/);
+  });
+
+  it('T19.18 README and CLAUDE.md no longer describe the hooks as shell form', () => {
+    for (const name of ['README.md', 'CLAUDE.md']) {
+      const text = readDoc(name).replace(/\s+/g, ' ');
+      assert.doesNotMatch(text, /hooks stay in \*\*shell form\*\*/i, name);
+      assert.doesNotMatch(text, /Do not switch to exec form/i, name);
+    }
+    assert.match(readDoc('CLAUDE.md'), /\*\*exec form\*\*/);
   });
 });

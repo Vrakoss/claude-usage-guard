@@ -16,7 +16,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const DOCS = ['README.md', 'CHANGELOG.md', 'CLAUDE.md'];
-const CALL_COUNT = /\b\d[\d,.]*\s*[kKmM]?[\s-]+(?:tool[\s-]+)?calls?\b/;
+// A personal volume is a count with a k/M suffix ("215k", "1.2M") or a plain
+// number of at least 1000 ("1000", "12,500"). Small counts ("the first 2 tool
+// calls") are ordinary prose, not usage volume, and must not trip the check.
+const CALL_COUNT =
+  /\b(?:\d[\d,.]*\s*[kKmM]|[1-9]\d{3,}|[1-9]\d{0,2}(?:,\d{3})+)[\s-]+(?:tool[\s-]+)?calls?\b/;
 const USAGE_WINDOW =
   /\b(?:last|past)\s+\d+\s+(?:days|weeks|months)\b|\b\d+\s+(?:days|weeks|months)\s+of\s+(?:usage|history|sessions|transcripts)\b/i;
 
@@ -57,5 +61,20 @@ describe('T20 public docs carry no personal usage volume', () => {
     assert.ok(CALL_COUNT.test(removed[1]));
     assert.ok(!CALL_COUNT.test('about 9% of tool calls'));
     assert.ok(!CALL_COUNT.test('on 200k valid keys'));
+  });
+
+  it('T20.5 a large count trips the check, a small count does not (issue #14)', () => {
+    for (const big of [
+      '1000 calls', '1,000 tool calls', '12,500-call run', '1.2M tool calls', '3 k calls',
+      '20000 tool calls',
+    ]) {
+      assert.ok(CALL_COUNT.test(big), `${big} must be flagged`);
+    }
+    for (const small of [
+      'the first 2 tool calls', '999 calls', 'after 10 calls', 'one or 2 calls',
+      'an extra 0999 calls', '2 more calls',
+    ]) {
+      assert.ok(!CALL_COUNT.test(small), `${small} must pass`);
+    }
   });
 });
