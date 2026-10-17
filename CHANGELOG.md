@@ -45,6 +45,9 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
 - README "Why these ten" and the 0.8.0 entry no longer state personal usage volume (a
   tool-call count and a time window). Only the ~9% and ~5% shares remain. A new test
   (`test/t20-docs-privacy.mjs`) fails if a usage-volume figure comes back.
+- CLAUDE.md: the test-convention sentence covers `t1`–`t22` and names every test file that
+  does not use `test/helpers.mjs`. A new test (`test/t22-claude-md-test-list.mjs`) fails
+  when a test file is added without updating that sentence.
 
 ## [0.8.0] - 2026-10-17
 
