@@ -69,8 +69,7 @@ lookahead:
   `mcp__fs__Read` or `ReadX` are still gated.
 - **Why these ten:** the read-only/local tools are cheap and cannot spend real quota on
   their own. Each call used to cost a Git Bash + Node spawn (~165 ms on Windows). On one
-  measured workload (215k tool calls from a single developer's last 60 days) all ten ungated
-  tools together were about 9% of tool calls; the read-only/local subset alone was about 5%,
+  developer's measured workload all ten ungated tools together were about 9% of tool calls; the read-only/local subset alone was about 5%,
   and the hand-back tools `StructuredOutput` and `SubagentHandback` most of the rest. The
   wind-down tools must stay usable at HARD: a hard-blocked sub-agent is told to return a
   resume brief to its caller, and with the old `*` matcher the hand-back tool

@@ -40,6 +40,9 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
   longer claims, without data, that almost every turn reaches a `Bash`/`Edit` call. It now
   says the overrun depends on the workload.
 - README: the cache validation bullet mentions the 256-key scan budget.
+- README "Why these ten" and the 0.8.0 entry no longer state personal usage volume (a
+  tool-call count and a time window). Only the ~9% and ~5% shares remain. A new test
+  (`test/t20-docs-privacy.mjs`) fails if a usage-volume figure comes back.
 
 ## [0.8.0] - 2026-10-17
 
@@ -49,7 +52,7 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
   denylist written as a JavaScript-RegExp negative lookahead. The guard is not spawned for
   `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TodoWrite`, `TaskOutput`, `TaskStop`,
   `SubagentHandback` and `StructuredOutput`. Everything else stays gated, including
-  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one measured 215k-call local
+  `ScheduleWakeup`, every `mcp__*` tool and any future tool. On one developer's measured
   workload the ten ungated tools together were ~9% of tool calls (the read-only/local subset
   ~5%), so ~9% of hook spawns are skipped, each one a Git Bash + Node pair costing ~165 ms on
   Windows.
