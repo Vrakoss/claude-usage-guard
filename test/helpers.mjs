@@ -188,15 +188,18 @@ export function makeDeps(overrides = {}) {
  * @param {object} windows - { five_hour: { utilization, resets_at }, ... }
  */
 export function makeCacheJson(fetchedAt, windows = {}) {
-  return JSON.stringify({ fetchedAt, failedAt: null, windows });
+  return JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, fetchedAt, failedAt: null, windows });
 }
 
 /**
  * Build a negative-cache JSON string (fetch recently failed).
  */
 export function makeNegativeCacheJson(failedAt, fetchedAt = null, windows = {}) {
-  return JSON.stringify({ fetchedAt, failedAt, windows });
+  return JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, fetchedAt, failedAt, windows });
 }
+
+/** On-disk cache schema version the guard reads/writes (issue #10). */
+export const CACHE_SCHEMA_VERSION = 1;
 
 /** Build a credentials file JSON with a given access token. */
 export function makeCredsJson(accessToken) {

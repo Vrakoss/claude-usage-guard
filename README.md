@@ -30,10 +30,11 @@ session pauses itself until the reset instead of burning retries (or your wallet
 
 The guard runs on two hook events and reads your usage from Anthropic's OAuth usage
 endpoint (cached locally). It compares the worst utilization across your rolling windows
-(`5h`, `7d`, and the per-model `7d-opus` / `7d-sonnet` windows when present) against two
-thresholds — **WARN** (default 80%) and **HARD** (default 95%). Windows whose reset time
-has already passed are ignored entirely — stale data can never block you past the actual
-reset.
+(`5h`, `7d`, and every per-model weekly window the endpoint reports — `7d-opus`,
+`7d-sonnet`, `7d-fable`, or any future `seven_day_<model>` key, shown as `7d-<model>`)
+against two thresholds — **WARN** (default 80%) and **HARD** (default 95%). Windows whose
+reset time has already passed are ignored entirely — stale data can never block you past
+the actual reset. At most 16 windows are kept (the four classic ones always first).
 
 Reset times are shown in your **local timezone** with fixed English labels, e.g.
 `[usage] 5h: 32% (reset Sun 15:50) | 7d: 5% (reset Wed 19 Jun 19:00)`.
@@ -118,8 +119,9 @@ All configuration is via environment variables. Invalid / non-numeric values fal
 the default; percentages are clamped to `1..100`; if `WARN ≥ HARD` both reset to defaults
 (the weekly pair is validated and reset independently of the base pair).
 
-The **5h** window uses the base `WARN`/`HARD`; the **weekly** windows (`7d`, `7d-opus`,
-`7d-sonnet`) use the separate `WEEKLY_WARN`/`WEEKLY_HARD`, which default higher so a slowly
+The **5h** window (and any `5h-<model>` window) uses the base `WARN`/`HARD`; the **weekly**
+windows (`7d`, `7d-opus`, `7d-sonnet`, and every other `7d-<model>`) use the separate
+`WEEKLY_WARN`/`WEEKLY_HARD`, which default higher so a slowly
 filling weekly window doesn't wind the agent down at the same low bar as the volatile 5h
 window. Each window is scored against its own thresholds and the **most severe** one drives
 the warn/block decision.
@@ -184,9 +186,13 @@ cannot leak through the usual exfiltration channels:
   (`~/.claude/usage-guard-cache.json`, written `0600` on POSIX — Windows ACLs
   inherit the user profile dir — atomic temp-file + rename writes) is
   run through a strict allowlist validator on every read: utilizations must be finite
-  numbers (clamped `0..100`), reset timestamps must parse to a valid date. Any deviation
-  discards the whole cache. **Nothing from the cache is ever echoed verbatim** — all output
-  is rebuilt from validated numbers and freshly re-formatted parsed dates.
+  numbers (clamped `0..100`), reset timestamps must parse to a valid date. A malformed
+  classic window (`5h`, `7d`, `7d-opus`, `7d-sonnet`) discards the whole cache; a malformed
+  or already-reset per-model window is dropped on its own. Window keys must match the strict
+  grammar `five_hour|seven_day` + optional `_<a-z0-9 segments>` (max 48 chars), and at most
+  16 windows are kept, so a poisoned payload cannot bloat the cache or the status line.
+  **Nothing from the cache is ever echoed verbatim** — all output is rebuilt from validated
+  numbers, freshly re-formatted parsed dates, and labels derived from the grammar-checked key.
 - **Allowlist debug logging.** Debug mode only ever writes a fixed set of event codes plus
   known-safe primitives (e.g. an HTTP `status` number). It never writes raw errors,
   response bodies, or anything from the credential path. As defense-in-depth, the final
@@ -229,6 +235,41 @@ cannot leak through the usual exfiltration channels:
   block (see [Where to set these](#where-to-set-these)) to bypass the guard entirely.
 - **Diagnose behavior.** Set `CLAUDE_USAGE_GUARD_DEBUG=1` and inspect
   `~/.claude/usage-guard-debug.log` (allowlisted, token-safe diagnostics).
+
+## Cache file contract (for other tools)
+
+Other tools (for example `gated-delivery` in subscription mode) may read
+`~/.claude/usage-guard-cache.json` **read-only** as a usage source, so they never touch your
+credentials. The shape is a stable contract, versioned by `schemaVersion`:
+
+```json
+{
+  "schemaVersion": 1,
+  "fetchedAt": 1760700000000,
+  "failedAt": null,
+  "windows": {
+    "five_hour":       { "utilization": 32, "resets_at": "2026-10-17T15:50:00.000Z" },
+    "seven_day":       { "utilization": 5,  "resets_at": "2026-10-22T19:00:00.000Z" },
+    "seven_day_fable": { "utilization": 41, "resets_at": "2026-10-22T19:00:00.000Z" }
+  }
+}
+```
+
+- `schemaVersion` — integer, currently `1`. It is bumped on any incompatible change; readers
+  should treat an unknown version as "no data". (The guard itself treats a cache without
+  the current version as a miss and refetches.)
+- `fetchedAt` — epoch milliseconds of the last successful fetch, or `null`.
+- `failedAt` — epoch milliseconds of the last failed fetch (a 5-minute negative-cache
+  marker), or `null`. After a failure `fetchedAt` is `null` and `windows` is `{}` — no
+  stale windows are carried forward.
+- `windows` — at most 16 entries keyed by the endpoint's own key (`five_hour`,
+  `seven_day`, `seven_day_<model>`, `five_hour_<model>`). Each entry has `utilization`
+  (number, clamped `0..100`) and `resets_at` (ISO-8601 UTC string). Absent windows are
+  omitted, never `null`. The guard's display label is `5h`/`7d` plus `-<model>` with
+  underscores turned into hyphens (`seven_day_oauth_apps` → `7d-oauth-apps`).
+
+The file is written atomically (temp file + rename) with mode `0600`. Readers should still
+validate it themselves and must not write to it.
 
 ## Uninstall
 
