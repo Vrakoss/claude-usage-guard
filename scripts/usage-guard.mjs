@@ -162,6 +162,17 @@ const WINDOW_CLASS_LABEL = { five_hour: '5h', seven_day: '7d' };
 export const MAX_WINDOWS = 16;
 
 /**
+ * Upper bound on keys EXAMINED per windows object (issue #13), so the
+ * poisoned-payload bound holds for CPU as well as size: at most this many keys
+ * (in Object.keys order: integer-like keys first, then insertion order) are
+ * grammar-checked and sorted, instead of every key
+ * before MAX_WINDOWS is applied. Known windows are looked up directly and are
+ * never subject to it. The real endpoint returns ~a dozen top-level keys, so
+ * 16 x MAX_WINDOWS is far above anything legitimate.
+ */
+export const MAX_WINDOW_KEY_SCAN = 16 * MAX_WINDOWS;
+
+/**
  * Version of the on-disk cache shape
  *   { schemaVersion, fetchedAt, failedAt, windows: { <key>: { utilization, resets_at } } }
  * The cache is a documented read-only contract for other tools (README). A cache
@@ -371,6 +382,13 @@ export function windowLabelForKey(key) {
  * The grammar-valid own keys of a windows object in deterministic priority
  * order: known keys first (WINDOW_LABELS order), then the rest sorted. Callers
  * apply the MAX_WINDOWS bound over this order, so known windows always survive.
+ *
+ * Known keys are looked up directly; only the first MAX_WINDOW_KEY_SCAN keys
+ * in payload order are considered for the rest, so the grammar check and the
+ * sort are bounded no matter how many keys a poisoned payload carries. Every
+ * own key counts toward the budget, known or not. (Object.keys itself stays
+ * linear; it is cheaper than JSON.parse of the same payload, and a breaking
+ * for...in measured slower, because V8 builds the full key list either way.)
  */
 function orderedWindowKeys(windows) {
   const known = [];
@@ -378,7 +396,10 @@ function orderedWindowKeys(windows) {
   for (const key of Object.keys(WINDOW_LABELS)) {
     if (Object.prototype.hasOwnProperty.call(windows, key)) known.push(key);
   }
-  for (const key of Object.keys(windows)) {
+  const keys = Object.keys(windows);
+  const scan = Math.min(keys.length, MAX_WINDOW_KEY_SCAN);
+  for (let i = 0; i < scan; i++) {
+    const key = keys[i];
     if (Object.prototype.hasOwnProperty.call(WINDOW_LABELS, key)) continue;
     if (windowLabelForKey(key) !== null) extra.push(key);
   }
