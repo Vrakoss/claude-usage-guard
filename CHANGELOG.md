@@ -36,9 +36,11 @@ Follow-ups from the reviews of 0.7.0 (issue #10) and 0.8.0 (issue #11), tracked 
 
 - Added the one-time upgrade note to the 0.7.0 entry: upgrading from 0.6.0 while
   hard-blocked leaves a short fail-open window until the next prompt refetches.
-- README: reflowed an over-long line in "Which tools are gated", and the first trade-off no
-  longer claims, without data, that almost every turn reaches a `Bash`/`Edit` call. It now
-  says the overrun depends on the workload.
+- README: reflowed the over-long lines in "Which tools are gated" ("Why these ten") and
+  "Sub-agents abort", and the first trade-off no longer claims, without data, that almost
+  every turn reaches a `Bash`/`Edit` call. It now says the overrun depends on the workload.
+  A new test (`test/t21-readme-line-width.mjs`) fails on any README prose line wider than
+  95 columns (code blocks, table rows and images are exempt).
 - README: the cache validation bullet mentions the 256-key scan budget.
 - README "Why these ten" and the 0.8.0 entry no longer state personal usage volume (a
   tool-call count and a time window). Only the ~9% and ~5% shares remain. A new test

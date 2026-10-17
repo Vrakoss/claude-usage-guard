@@ -69,12 +69,13 @@ lookahead:
   `mcp__fs__Read` or `ReadX` are still gated.
 - **Why these ten:** the read-only/local tools are cheap and cannot spend real quota on
   their own. Each call used to cost a Git Bash + Node spawn (~165 ms on Windows). On one
-  developer's measured workload all ten ungated tools together were about 9% of tool calls; the read-only/local subset alone was about 5%,
-  and the hand-back tools `StructuredOutput` and `SubagentHandback` most of the rest. The
-  wind-down tools must stay usable at HARD: a hard-blocked sub-agent is told to return a
-  resume brief to its caller, and with the old `*` matcher the hand-back tool
-  (`SubagentHandback`, or `StructuredOutput` for workflow agents) was itself blocked, so the
-  brief was lost. `TaskStop` lets the model halt background work while paused.
+  developer's measured workload all ten ungated tools together were about 9% of tool
+  calls; the read-only/local subset alone was about 5%, and the hand-back tools
+  `StructuredOutput` and `SubagentHandback` most of the rest. The wind-down tools must stay
+  usable at HARD: a hard-blocked sub-agent is told to return a resume brief to its caller,
+  and with the old `*` matcher the hand-back tool (`SubagentHandback`, or `StructuredOutput`
+  for workflow agents) was itself blocked, so the brief was lost. `TaskStop` lets the model
+  halt background work while paused.
 
 **Trade-offs (residual risks):**
 
@@ -135,10 +136,10 @@ Sub-agents (detected via the `agent_id` field in the `PreToolUse` hook input) ca
 `ScheduleWakeup` — it is only available on the main agent thread. When a sub-agent is
 hard-blocked, the guard instructs it to **abort immediately** and return a resume brief to
 its caller through its hand-back tool (`SubagentHandback`, or `StructuredOutput` for
-workflow agents), which stays ungated for exactly this purpose: current state, remaining steps, and exact relaunch instructions (context, tool
-calls, arguments). The caller embeds this brief in the wakeup prompt
-(after `[usage-guard:resume]`) so the sub-agent can be relaunched fresh after reset with
-full context.
+workflow agents), which stays ungated for exactly this purpose: current state, remaining
+steps, and exact relaunch instructions (context, tool calls, arguments). The caller embeds
+this brief in the wakeup prompt (after `[usage-guard:resume]`) so the sub-agent can be
+relaunched fresh after reset with full context.
 
 ## Install
 
